@@ -210,7 +210,6 @@ def evaluate_article(
     article,
     topics,
 ):
-
     title = normalize_text(
         article.get(
             "title",
@@ -231,7 +230,8 @@ def evaluate_article(
         + excerpt
     )
 
-    results = []
+    matched_topics = []
+    all_keywords = []
 
     for topic in topics:
 
@@ -240,7 +240,6 @@ def evaluate_article(
         for keyword in topic[
             "keywords"
         ]:
-
             if keyword_matches(
                 text,
                 keyword,
@@ -254,7 +253,6 @@ def evaluate_article(
         for keyword in topic[
             "exclusions"
         ]:
-
             if keyword_matches(
                 text,
                 keyword,
@@ -263,18 +261,12 @@ def evaluate_article(
                     keyword
                 )
 
-        # Exclusion overrides positive match
+        # Exclusion overrides matches
         if excluded:
             matched = []
 
         if not matched:
             continue
-
-        # ----------------------------------------------------
-        # Basic relevance score
-        #
-        # Title matches are weighted more heavily.
-        # ----------------------------------------------------
 
         title_matches = sum(
             1
@@ -290,57 +282,65 @@ def evaluate_article(
             - title_matches
         )
 
-        score = (
+        topic_score = (
             title_matches * 25
             + excerpt_matches * 10
             + topic["priority"] * 5
         )
 
-        score = min(
-            score,
+        topic_score = min(
+            topic_score,
             100,
         )
 
-        results.append(
+        matched_topics.append(
             {
-                "topic": topic[
+                "name": topic[
                     "name"
                 ],
-                "score": score,
-                "matched_keywords": matched,
+                "score": topic_score,
             }
         )
 
-    if not results:
+        all_keywords.extend(
+            matched
+        )
 
+    if not matched_topics:
         return {
-            "topic": "",
-            "score": 0,
+            "matched_topics": [],
+            "rule_score": 0,
             "matched_keywords": [],
         }
 
-    # Highest score wins
-    results.sort(
+    # Remove duplicate keywords
+    all_keywords = list(
+        dict.fromkeys(
+            all_keywords
+        )
+    )
+
+    # Highest topic score becomes
+    # the overall rule score.
+    matched_topics.sort(
         key=lambda item: item[
             "score"
         ],
         reverse=True,
     )
 
-    best = results[0]
+    best_score = matched_topics[0][
+        "score"
+    ]
 
     return {
-        "topic": best[
-            "topic"
+        "matched_topics": [
+            item["name"]
+            for item in matched_topics
         ],
-        "score": best[
-            "score"
-        ],
-        "matched_keywords": best[
-            "matched_keywords"
-        ],
+        "rule_score": best_score,
+        "matched_keywords": all_keywords,
     }
-
 
 # ============================================================
 # PROCESS ARTICLES
@@ -379,8 +379,8 @@ def process_articles(
         "article_id",
         "title",
         "excerpt",
-        "topic",
-        "relevance_score",
+        "matched_topics",
+        "rule_score",
         "matched_keywords",
     ]
 
@@ -408,6 +408,13 @@ def process_articles(
             )
         )
 
+        current_score = clean_text(
+            article.get(
+                "rule_score",
+                "",
+            )
+        )
+        
         if current_score:
             continue
 
@@ -416,14 +423,16 @@ def process_articles(
             topics,
         )
 
-        topic = result[
-            "topic"
-        ]
-
+        matched_topics = ", ".join(
+            result[
+                "matched_topics"
+            ]
+        )
+        
         score = result[
-            "score"
+            "rule_score"
         ]
-
+        
         matched_keywords = ", ".join(
             result[
                 "matched_keywords"
@@ -435,7 +444,9 @@ def process_articles(
                 "range": (
                     f"{gspread.utils.rowcol_to_a1(
                         row_number,
-                        header_index["topic"]
+                        header_index[
+                            "matched_topics"
+                        ]
                     )}"
                 ),
                 "values": [
@@ -450,7 +461,7 @@ def process_articles(
                     f"{gspread.utils.rowcol_to_a1(
                         row_number,
                         header_index[
-                            "relevance_score"
+                            "rule_score"
                         ]
                     )}"
                 ),
@@ -481,18 +492,19 @@ def process_articles(
         )
 
         print(
-            f"  Topic: {topic or 'NONE'}"
+            f"  Topics: "
+            f"{matched_topics or 'NONE'}"
         )
-
+        
         print(
-            f"  Score: {score}"
+            f"  Rule score: "
+            f"{score}"
         )
-
+        
         print(
             f"  Keywords: "
             f"{matched_keywords or 'NONE'}"
         )
-
     if not updates:
 
         print(
