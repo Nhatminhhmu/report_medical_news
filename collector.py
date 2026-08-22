@@ -13,9 +13,6 @@ from google.oauth2.service_account import Credentials
 
 from parsers import himss
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -38,7 +35,6 @@ USER_AGENT = (
 # ============================================================
 
 def get_google_client():
-
     credentials_json = os.environ[
         "GOOGLE_SERVICE_ACCOUNT_JSON"
     ]
@@ -74,21 +70,12 @@ def get_google_client():
 # ============================================================
 
 def utc_now():
-
     return datetime.now(
         timezone.utc
     ).isoformat()
 
 
-def make_article_id(url):
-
-    return hashlib.sha256(
-        url.strip().encode("utf-8")
-    ).hexdigest()[:16]
-
-
 def clean_text(value):
-
     if value is None:
         return ""
 
@@ -97,11 +84,16 @@ def clean_text(value):
     ).strip()
 
 
+def make_article_id(url):
+    return hashlib.sha256(
+        url.strip().encode("utf-8")
+    ).hexdigest()[:16]
+
+
 def normalize_url(
     url,
     base_url=None,
 ):
-
     url = clean_text(url)
 
     if not url:
@@ -117,13 +109,12 @@ def normalize_url(
 
 
 # ============================================================
-# READ ACTIVE SOURCES
+# READ SOURCES
 # ============================================================
 
 def get_active_sources(
     spreadsheet,
 ):
-
     worksheet = spreadsheet.worksheet(
         SOURCES_SHEET
     )
@@ -133,7 +124,6 @@ def get_active_sources(
     sources = []
 
     for row in records:
-
         active = (
             str(
                 row.get(
@@ -184,9 +174,7 @@ def get_active_sources(
             )
             continue
 
-        sources.append(
-            row
-        )
+        sources.append(row)
 
     return sources
 
@@ -195,10 +183,7 @@ def get_active_sources(
 # RSS COLLECTOR
 # ============================================================
 
-def collect_rss(
-    source,
-):
-
+def collect_rss(source):
     name = clean_text(
         source.get("name")
     )
@@ -208,7 +193,6 @@ def collect_rss(
     )
 
     if not feed_url:
-
         raise ValueError(
             "RSS source has no feed_url"
         )
@@ -227,7 +211,6 @@ def collect_rss(
         "bozo",
         False,
     ):
-
         print(
             f"[RSS] Warning for {name}: "
             "feed parser reported an issue."
@@ -236,7 +219,6 @@ def collect_rss(
     articles = []
 
     for entry in feed.entries:
-
         title = clean_text(
             entry.get(
                 "title",
@@ -274,9 +256,6 @@ def collect_rss(
 
         articles.append(
             {
-                "article_id": make_article_id(
-                    url
-                ),
                 "source": name,
                 "title": title,
                 "url": url,
@@ -288,8 +267,6 @@ def collect_rss(
                         "",
                     )
                 ),
-                "status": "DISCOVERED",
-                "discovered_at": utc_now(),
             }
         )
 
@@ -302,13 +279,10 @@ def collect_rss(
 
 
 # ============================================================
-# WEB COLLECTOR
+# GENERIC WEB COLLECTOR
 # ============================================================
 
-def collect_web(
-    source,
-):
-
+def collect_web(source):
     name = clean_text(
         source.get("name")
     )
@@ -318,7 +292,6 @@ def collect_web(
     )
 
     if not listing_url:
-
         raise ValueError(
             "WEB source has no listing_url"
         )
@@ -346,18 +319,35 @@ def collect_web(
     )
 
     articles = []
-
-    # --------------------------------------------------------
-    # Generic article discovery
-    #
-    # We intentionally do not assume a single CSS selector.
-    # We inspect links that point to article/news-like URLs.
-    # --------------------------------------------------------
-
     seen_urls = set()
 
-    for link in soup.find_all("a"):
+    article_indicators = [
+        "/news/",
+        "/article/",
+        "/articles/",
+        "/news-center/",
+        "/blog/",
+        "/insights/",
+        "/stories/",
+    ]
 
+    ignored_patterns = [
+        "/search",
+        "/login",
+        "/contact",
+        "/about",
+        "/events",
+        "/membership",
+        "/privacy",
+        "/terms",
+        "javascript:",
+        "#",
+    ]
+
+    for link in soup.find_all(
+        "a",
+        href=True,
+    ):
         href = link.get("href")
 
         title = clean_text(
@@ -381,21 +371,7 @@ def collect_web(
         if url in seen_urls:
             continue
 
-        # Ignore obvious non-article links.
         lowered_url = url.lower()
-
-        ignored_patterns = [
-            "/search",
-            "/login",
-            "/contact",
-            "/about",
-            "/events",
-            "/membership",
-            "/privacy",
-            "/terms",
-            "javascript:",
-            "#",
-        ]
 
         if any(
             pattern in lowered_url
@@ -403,26 +379,12 @@ def collect_web(
         ):
             continue
 
-        # Article-like URL heuristic.
-        article_indicators = [
-            "/news/",
-            "/article/",
-            "/articles/",
-            "/news-center/",
-            "/blog/",
-            "/insights/",
-            "/stories/",
-        ]
-
-        looks_like_article = any(
+        if not any(
             indicator in lowered_url
             for indicator in article_indicators
-        )
-
-        if not looks_like_article:
+        ):
             continue
 
-        # Avoid navigation labels.
         if len(title) < 20:
             continue
 
@@ -433,9 +395,6 @@ def collect_web(
 
         articles.append(
             {
-                "article_id": make_article_id(
-                    url
-                ),
                 "source": name,
                 "title": title,
                 "url": url,
@@ -447,8 +406,6 @@ def collect_web(
                         "",
                     )
                 ),
-                "status": "DISCOVERED",
-                "discovered_at": utc_now(),
             }
         )
 
@@ -464,10 +421,7 @@ def collect_web(
 # API PLACEHOLDER
 # ============================================================
 
-def collect_api(
-    source,
-):
-
+def collect_api(source):
     name = clean_text(
         source.get("name")
     )
@@ -482,10 +436,7 @@ def collect_api(
 # SOURCE DISPATCHER
 # ============================================================
 
-def collect_source(
-    source,
-):
-
+def collect_source(source):
     name = clean_text(
         source.get(
             "name",
@@ -504,11 +455,10 @@ def collect_source(
     )
 
     # --------------------------------------------------------
-    # Source-specific parser
+    # HIMSS-specific parser
     # --------------------------------------------------------
 
     if name.lower() == "himss":
-
         return himss.collect(
             source
         )
@@ -518,19 +468,16 @@ def collect_source(
     # --------------------------------------------------------
 
     if access_method == "RSS":
-
         return collect_rss(
             source
         )
 
     if access_method == "WEB":
-
         return collect_web(
             source
         )
 
     if access_method == "API":
-
         return collect_api(
             source
         )
@@ -542,44 +489,13 @@ def collect_source(
 
 
 # ============================================================
-# EXISTING ARTICLE IDS
+# NORMALIZE ARTICLES
 # ============================================================
 
-def get_existing_article_ids(
-    spreadsheet,
-):
-
-    worksheet = spreadsheet.worksheet(
-        ARTICLES_SHEET
-    )
-
-    records = (
-        worksheet.get_all_records()
-    )
-
-    return {
-        clean_text(
-            row.get(
-                "article_id",
-                "",
-            )
-        )
-        for row in records
-        if row.get(
-            "article_id",
-            "",
-        )
-    }
-
-
-def normalize_articles(
-    articles,
-):
-
+def normalize_articles(articles):
     normalized = []
 
     for article in articles:
-
         url = clean_text(
             article.get(
                 "url",
@@ -637,6 +553,34 @@ def normalize_articles(
 
 
 # ============================================================
+# EXISTING ARTICLE IDS
+# ============================================================
+
+def get_existing_article_ids(
+    spreadsheet,
+):
+    worksheet = spreadsheet.worksheet(
+        ARTICLES_SHEET
+    )
+
+    records = worksheet.get_all_records()
+
+    return {
+        clean_text(
+            row.get(
+                "article_id",
+                "",
+            )
+        )
+        for row in records
+        if row.get(
+            "article_id",
+            "",
+        )
+    }
+
+
+# ============================================================
 # SAVE ARTICLES
 # ============================================================
 
@@ -644,7 +588,6 @@ def save_articles(
     spreadsheet,
     articles,
 ):
-
     worksheet = spreadsheet.worksheet(
         ARTICLES_SHEET
     )
@@ -658,7 +601,6 @@ def save_articles(
     unique_articles = {}
 
     for article in articles:
-
         article_id = article[
             "article_id"
         ]
@@ -675,7 +617,6 @@ def save_articles(
     )
 
     if not new_articles:
-
         print(
             "No new articles to save."
         )
@@ -685,7 +626,6 @@ def save_articles(
     rows = []
 
     for article in new_articles:
-
         rows.append(
             [
                 article[
@@ -702,6 +642,9 @@ def save_articles(
                 ],
                 article[
                     "published_at"
+                ],
+                article[
+                    "excerpt"
                 ],
                 article[
                     "topic"
@@ -732,7 +675,6 @@ def save_articles(
 # ============================================================
 
 def main():
-
     spreadsheet = get_google_client()
 
     print(
@@ -753,12 +695,7 @@ def main():
 
     source_results = []
 
-    # --------------------------------------------------------
-    # COLLECT EACH SOURCE INDEPENDENTLY
-    # --------------------------------------------------------
-
     for source in sources:
-
         name = clean_text(
             source.get(
                 "name",
@@ -767,32 +704,32 @@ def main():
         )
 
         try:
-
             articles = collect_source(
                 source
             )
 
-            normalized_articles = normalize_articles(
-    			articles
-			)
+            normalized_articles = (
+                normalize_articles(
+                    articles
+                )
+            )
 
-			all_articles.extend(
-    			normalized_articles
-			)
+            all_articles.extend(
+                normalized_articles
+            )
 
             source_results.append(
                 {
                     "name": name,
                     "status": "OK",
                     "count": len(
-                        articles
+                        normalized_articles
                     ),
                     "error": "",
                 }
             )
 
         except Exception as e:
-
             print(
                 f"[ERROR] {name}: {e}"
             )
@@ -806,17 +743,12 @@ def main():
                 }
             )
 
-    # --------------------------------------------------------
-    # SUMMARY
-    # --------------------------------------------------------
-
     print("")
     print("=" * 60)
     print("COLLECTION SUMMARY")
     print("=" * 60)
 
     for result in source_results:
-
         print(
             f"{result['name']}: "
             f"{result['status']} "
@@ -835,10 +767,6 @@ def main():
         f"Total candidates collected: "
         f"{len(all_articles)}"
     )
-
-    # --------------------------------------------------------
-    # SAVE
-    # --------------------------------------------------------
 
     saved = save_articles(
         spreadsheet,
