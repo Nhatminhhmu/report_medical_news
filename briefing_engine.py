@@ -1,148 +1,240 @@
-import json
 import os
+import json
 import re
+import time
 from datetime import datetime, timezone
-from html import unescape
-from urllib.parse import urlparse
 
 import gspread
-import requests
-from bs4 import BeautifulSoup
 from google.oauth2.service_account import Credentials
 from openai import OpenAI
+import requests
+from bs4 import BeautifulSoup
 
 
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive",
-]
+# ============================================================
+# AI BRIEFING ENGINE
+# Version: 0.2
+# ============================================================
+
+APP_VERSION = "0.2"
+
+DEFAULT_MODEL = "gpt-5.6-luna"
+DEFAULT_LANGUAGE = "Vietnamese"
+DEFAULT_MAX_CONTENT_CHARS = 50000
 
 ARTICLES_SHEET = "Articles"
 BRIEFINGS_SHEET = "Briefings"
 SETTINGS_SHEET = "Settings"
 
-DEFAULT_MODEL = "gpt-5.6-luna"
-DEFAULT_MAX_CONTENT_CHARS = 50000
-DEFAULT_LANGUAGE = "Vietnamese"
+ARTICLE_STATUS_SELECTED = "SELECTED"
+ARTICLE_STATUS_BRIEFED = "BRIEFED"
+ARTICLE_STATUS_BRIEFING_ERROR = "BRIEFING_ERROR"
 
-REQUEST_TIMEOUT = 30
+BRIEFING_FIELDS = [
+    "article_id",
+    "source",
+    "title",
+    "url",
+    "published_at",
+    "rule_score",
+    "topics",
+    "summary",
+    "key_points",
+    "why_it_matters",
+    "implications",
+    "model",
+    "created_at",
+    "status",
+]
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 "
-        "(compatible; ReportMedicalNews/1.0)"
-    )
-}
+
+# ============================================================
+# DEFAULT PROMPT
+# Used only when Settings.briefing_prompt is missing.
+# ============================================================
+
+DEFAULT_BRIEFING_PROMPT = """
+Bạn là một chuyên gia phân tích thông tin y tế và vận hành bệnh viện.
+
+Hãy đọc TOÀN BỘ nội dung bài viết bên dưới và tạo một briefing
+ngắn gọn, chính xác, có giá trị cho một người làm:
+
+- quản trị bệnh viện;
+- chiến lược y tế;
+- vận hành bệnh viện;
+- chuyển đổi số y tế;
+- marketing/truyền thông y tế;
+- phát triển kinh doanh trong lĩnh vực healthcare.
+
+Ngôn ngữ output: {language}.
+
+NGUYÊN TẮC:
+
+1. Chỉ sử dụng thông tin có trong bài viết.
+2. Không bịa số liệu, tên người, tổ chức, kết quả hoặc nguyên nhân.
+3. Không biến suy luận thành fact.
+4. Nếu bài viết không đủ thông tin, hãy nói rõ thay vì đoán.
+5. Phân biệt nội dung bài viết với phân tích của bạn.
+6. Không viết lại toàn bộ bài.
+7. Giúp người đọc nhanh chóng hiểu:
+   - chuyện gì xảy ra;
+   - điều gì quan trọng;
+   - ý nghĩa đối với healthcare/hospital management.
+8. Không cố ép các bài tin nhân sự hoặc tin doanh nghiệp
+   thành phân tích chiến lược nếu nội dung không hỗ trợ.
+9. Không sử dụng markdown heading trong các field output.
+10. key_points và implications phải là các ý độc lập, ngắn gọn.
+
+SOURCE:
+{source}
+
+TITLE:
+{title}
+
+MATCHED TOPICS:
+{topics}
+
+ARTICLE:
+{article_text}
+""".strip()
 
 
-def clean_text(value):
-    if value is None:
-        return ""
-
-    return " ".join(
-        str(value).split()
-    ).strip()
-
+# ============================================================
+# GOOGLE SHEETS
+# ============================================================
 
 def get_spreadsheet():
-    credentials_json = os.environ[
-        "GOOGLE_SERVICE_ACCOUNT_JSON"
+    credentials_json = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
+    spreadsheet_id = os.environ["GOOGLE_SPREADSHEET_ID"]
+
+    credentials_info = json.loads(credentials_json)
+
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
     ]
 
-    spreadsheet_id = os.environ[
-        "GOOGLE_SPREADSHEET_ID"
+    credentials = Credentials.from_service_account_info(
+        credentials_info,
+        scopes=scopes,
+    )
+
+    client = gspread.authorize(credentials)
+
+    spreadsheet = client.open_by_key(spreadsheet_id)
+
+    print(f"Connected to: {spreadsheet.title}")
+
+    return spreadsheet
+
+
+# ============================================================
+# SETTINGS
+# ============================================================
+
+def load_settings(spreadsheet):
+    try:
+        worksheet = spreadsheet.worksheet(SETTINGS_SHEET)
+    except gspread.WorksheetNotFound:
+        return {}
+
+    values = worksheet.get_all_values()
+
+    if not values:
+        return {}
+
+    headers = [
+        str(value).strip()
+        for value in values[0]
     ]
 
-    credentials_info = json.loads(
-        credentials_json
-    )
+    settings = {}
 
-    credentials = (
-        Credentials
-        .from_service_account_info(
-            credentials_info,
-            scopes=SCOPES,
-        )
-    )
+    for row in values[1:]:
+        if not row:
+            continue
 
-    client = gspread.authorize(
-        credentials
-    )
+        row_data = {}
 
-    return client.open_by_key(
-        spreadsheet_id
-    )
+        for index, header in enumerate(headers):
+            if index < len(row):
+                row_data[header] = row[index]
 
+        key = (
+            row_data.get("key")
+            or row_data.get("name")
+            or row_data.get("setting")
+            or ""
+        ).strip()
 
-def get_settings(spreadsheet):
-    settings = {
-        "briefing_model": DEFAULT_MODEL,
-        "briefing_max_content_chars":
-            DEFAULT_MAX_CONTENT_CHARS,
-        "briefing_language":
-            DEFAULT_LANGUAGE,
-    }
+        value = row_data.get("value", "").strip()
 
-    try:
-        worksheet = spreadsheet.worksheet(
-            SETTINGS_SHEET
-        )
-
-        records = worksheet.get_all_records()
-
-        for row in records:
-            key = clean_text(
-                row.get("key")
-            )
-
-            value = clean_text(
-                row.get("value")
-            )
-
-            if key in settings and value:
-                settings[key] = value
-
-    except Exception as exc:
-        print(
-            f"[SETTINGS] Warning: {exc}"
-        )
-
-    try:
-        settings[
-            "briefing_max_content_chars"
-        ] = int(
-            settings[
-                "briefing_max_content_chars"
-            ]
-        )
-    except (TypeError, ValueError):
-        settings[
-            "briefing_max_content_chars"
-        ] = DEFAULT_MAX_CONTENT_CHARS
+        if key:
+            settings[key] = value
 
     return settings
 
 
-def get_articles(worksheet):
-    return worksheet.get_all_records()
+def get_setting(settings, key, default=None):
+    value = settings.get(key)
+
+    if value is None:
+        return default
+
+    if str(value).strip() == "":
+        return default
+
+    return value
 
 
-def get_briefings(worksheet):
-    return worksheet.get_all_records()
+def get_int_setting(settings, key, default):
+    try:
+        return int(
+            get_setting(
+                settings,
+                key,
+                default,
+            )
+        )
+    except (ValueError, TypeError):
+        return default
 
 
-def extract_article_content(
-    url,
-    max_chars,
-):
-    print(
-        f"[FETCH] {url}"
+# ============================================================
+# OPENAI
+# ============================================================
+
+def get_openai_client():
+    api_key = os.environ["OPENAI_API_KEY"]
+
+    return OpenAI(
+        api_key=api_key
     )
+
+
+# ============================================================
+# HTTP / ARTICLE EXTRACTION
+# ============================================================
+
+def fetch_article(url):
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 "
+            "(KHTML, like Gecko) "
+            "Chrome/131.0 Safari/537.36"
+        ),
+        "Accept": (
+            "text/html,application/xhtml+xml,"
+            "application/xml;q=0.9,*/*;q=0.8"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+    }
 
     response = requests.get(
         url,
-        headers=HEADERS,
-        timeout=REQUEST_TIMEOUT,
+        headers=headers,
+        timeout=30,
     )
 
     response.raise_for_status()
@@ -152,277 +244,462 @@ def extract_article_content(
         "html.parser",
     )
 
-    # Remove obvious non-content elements.
-    for tag in soup([
+    for element in soup([
         "script",
         "style",
         "noscript",
+        "svg",
         "nav",
         "header",
         "footer",
         "aside",
         "form",
-        "iframe",
-        "svg",
     ]):
-        tag.decompose()
+        element.decompose()
 
-    candidates = []
-
-    # Prefer semantic article containers.
-    selectors = [
-        "article",
-        '[role="main"]',
-        "main",
-        ".article-body",
-        ".article-content",
-        ".entry-content",
-        ".post-content",
-        ".story-body",
-        ".content-body",
-    ]
-
-    for selector in selectors:
-        for node in soup.select(
-            selector
-        ):
-            text = clean_text(
-                node.get_text(
-                    " ",
-                    strip=True,
-                )
-            )
-
-            if len(text) > 300:
-                candidates.append(text)
-
-    if candidates:
-        content = max(
-            candidates,
-            key=len,
+    article = (
+        soup.find("article")
+        or soup.find(
+            "div",
+            class_=re.compile(
+                r"(article|post|entry|content|story)",
+                re.I,
+            ),
         )
-    else:
-        paragraphs = []
-
-        for paragraph in soup.find_all(
-            "p"
-        ):
-            text = clean_text(
-                paragraph.get_text(
-                    " ",
-                    strip=True,
-                )
-            )
-
-            if len(text) >= 40:
-                paragraphs.append(text)
-
-        content = "\n\n".join(
-            paragraphs
-        )
-
-    content = unescape(content)
-
-    # Remove excessive whitespace.
-    content = re.sub(
-        r"\n{3,}",
-        "\n\n",
-        content,
+        or soup.body
     )
 
-    content = clean_text(
-        content
-    )
-
-    if not content:
+    if article is None:
         raise ValueError(
-            "Could not extract article content."
+            "Could not locate article content."
         )
 
-    if len(content) > max_chars:
-        print(
-            f"[FETCH] Content truncated: "
-            f"{len(content)} -> "
-            f"{max_chars} chars"
+    text = article.get_text(
+        "\n",
+        strip=True,
+    )
+
+    lines = []
+
+    for line in text.splitlines():
+        line = re.sub(
+            r"\s+",
+            " ",
+            line,
+        ).strip()
+
+        if line:
+            lines.append(line)
+
+    return "\n".join(lines)
+
+
+# ============================================================
+# CELL NORMALIZATION
+# ============================================================
+
+def normalize_cell(value):
+    """
+    Convert AI output into a Google Sheets-safe scalar.
+    """
+
+    if value is None:
+        return ""
+
+    if isinstance(value, list):
+        cleaned = []
+
+        for item in value:
+            if item is None:
+                continue
+
+            if isinstance(item, dict):
+                item = json.dumps(
+                    item,
+                    ensure_ascii=False,
+                )
+
+            item = str(item).strip()
+
+            if item:
+                cleaned.append(
+                    f"• {item}"
+                )
+
+        return "\n".join(cleaned)
+
+    if isinstance(value, dict):
+        return json.dumps(
+            value,
+            ensure_ascii=False,
         )
 
-        content = content[
-            :max_chars
-        ]
+    if isinstance(value, bool):
+        return (
+            "TRUE"
+            if value
+            else "FALSE"
+        )
 
-    return content
+    return str(value).strip()
 
+
+# ============================================================
+# STRUCTURED OUTPUT SCHEMA
+# ============================================================
+
+BRIEFING_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "summary": {
+            "type": "string",
+        },
+        "key_points": {
+            "type": "array",
+            "items": {
+                "type": "string",
+            },
+        },
+        "why_it_matters": {
+            "type": "string",
+        },
+        "implications": {
+            "type": "array",
+            "items": {
+                "type": "string",
+            },
+        },
+    },
+    "required": [
+        "summary",
+        "key_points",
+        "why_it_matters",
+        "implications",
+    ],
+}
+
+
+# ============================================================
+# PROMPT BUILDING
+# ============================================================
 
 def build_prompt(
-    article,
-    content,
+    prompt_template,
+    title,
+    source,
+    topics,
+    article_text,
     language,
 ):
-    title = clean_text(
-        article.get("title")
-    )
+    values = {
+        "language": language,
+        "source": source,
+        "title": title,
+        "topics": normalize_cell(topics),
+        "article_text": article_text,
+    }
 
-    source = clean_text(
-        article.get("source")
-    )
+    try:
+        prompt = prompt_template.format(
+            **values
+        )
+    except KeyError as exc:
+        raise ValueError(
+            "Unknown placeholder in "
+            f"briefing_prompt: {exc}"
+        )
 
-    topics = clean_text(
-        article.get("matched_topics")
-    )
+    return prompt.strip()
 
-    rule_score = clean_text(
-        article.get("rule_score")
-    )
 
-    return f"""
-You are producing a healthcare intelligence briefing.
-
-Read the FULL ARTICLE CONTENT below.
-
-Your task is to summarize and analyze ONLY what is supported
-by the article.
-
-Language: {language}
-
-Article metadata:
-Source: {source}
-Title: {title}
-Topics: {topics}
-Rule score: {rule_score}
-
-Requirements:
-
-1. summary
-Write a concise 2–4 sentence summary of what the article says.
-
-2. key_points
-Identify 3–5 important factual points from the article.
-
-3. why_it_matters
-Explain why this article may matter to a healthcare
-management, hospital operations, healthcare business,
-digital health, workforce, patient experience, quality,
-or strategy reader.
-
-4. implications
-Identify practical implications for healthcare organizations
-ONLY when they are reasonably supported by the article.
-Do not invent facts, numbers, recommendations, or outcomes.
-
-If no clear operational implication can be identified, return:
-"No clear operational implication identified from the article."
-
-Important:
-- Do not fabricate information.
-- Do not infer facts that are not in the article.
-- Distinguish interpretation from facts.
-- Do not mention that you are an AI.
-- Do not include markdown headings inside individual fields.
-
-FULL ARTICLE CONTENT:
-{content}
-""".strip()
-
+# ============================================================
+# AI BRIEFING
+# ============================================================
 
 def generate_briefing(
     client,
     model,
-    article,
-    content,
+    prompt_template,
+    title,
+    source,
+    topics,
+    article_text,
     language,
 ):
     prompt = build_prompt(
-        article,
-        content,
-        language,
+        prompt_template=prompt_template,
+        title=title,
+        source=source,
+        topics=topics,
+        article_text=article_text,
+        language=language,
     )
 
     response = client.responses.create(
         model=model,
         input=prompt,
+        text={
+            "format": {
+                "type": "json_schema",
+                "name": "medical_news_briefing",
+                "strict": True,
+                "schema": BRIEFING_SCHEMA,
+            }
+        },
     )
 
-    text = response.output_text.strip()
+    output_text = response.output_text
 
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
+    if not output_text:
         raise ValueError(
-            "OpenAI returned invalid JSON."
+            "OpenAI returned an empty response."
         )
 
+    try:
+        data = json.loads(
+            output_text
+        )
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            "Structured output could not "
+            "be parsed as JSON."
+        ) from exc
 
-def ensure_briefing_columns(
-    worksheet
-):
-    expected = [
-        "article_id",
-        "source",
-        "title",
-        "url",
-        "published_at",
-        "rule_score",
-        "topics",
+    validate_briefing(data)
+
+    return data
+
+
+def validate_briefing(data):
+    if not isinstance(data, dict):
+        raise ValueError(
+            "Briefing output is not an object."
+        )
+
+    required = [
         "summary",
         "key_points",
         "why_it_matters",
         "implications",
-        "model",
-        "created_at",
-        "status",
     ]
 
-    headers = worksheet.row_values(1)
+    for field in required:
+        if field not in data:
+            raise ValueError(
+                f"Missing briefing field: {field}"
+            )
 
-    if not headers:
-        worksheet.update(
-            "A1",
-            [expected],
-        )
-        return expected
-
-    missing = [
-        column
-        for column in expected
-        if column not in headers
-    ]
-
-    if missing:
+    if not isinstance(
+        data["summary"],
+        str,
+    ):
         raise ValueError(
-            "Briefings is missing columns: "
-            + ", ".join(missing)
+            "summary must be a string."
         )
 
-    return headers
+    if not isinstance(
+        data["why_it_matters"],
+        str,
+    ):
+        raise ValueError(
+            "why_it_matters must be a string."
+        )
+
+    if not isinstance(
+        data["key_points"],
+        list,
+    ):
+        raise ValueError(
+            "key_points must be a list."
+        )
+
+    if not isinstance(
+        data["implications"],
+        list,
+    ):
+        raise ValueError(
+            "implications must be a list."
+        )
+
+    for item in data["key_points"]:
+        if not isinstance(item, str):
+            raise ValueError(
+                "Every key_points item "
+                "must be a string."
+            )
+
+    for item in data["implications"]:
+        if not isinstance(item, str):
+            raise ValueError(
+                "Every implications item "
+                "must be a string."
+            )
 
 
-def briefing_exists(
-    briefings,
+# ============================================================
+# SHEET HELPERS
+# ============================================================
+
+def header_map(headers):
+    return {
+        str(header).strip(): index
+        for index, header in enumerate(headers)
+    }
+
+
+def row_value(
+    row,
+    mapping,
+    field,
+):
+    index = mapping.get(field)
+
+    if index is None:
+        return ""
+
+    if index >= len(row):
+        return ""
+
+    return row[index]
+
+
+def update_article_status(
+    worksheet,
+    row_number,
+    mapping,
+    status,
+):
+    status_index = mapping.get("status")
+
+    if status_index is None:
+        raise ValueError(
+            "Articles sheet is missing "
+            "status column."
+        )
+
+    cell = gspread.utils.rowcol_to_a1(
+        row_number,
+        status_index + 1,
+    )
+
+    worksheet.update(
+        range_name=cell,
+        values=[[status]],
+    )
+
+
+# ============================================================
+# BRIEFING DUPLICATE CHECK
+# ============================================================
+
+def find_briefing_by_article_id(
+    worksheet,
     article_id,
 ):
-    for row in briefings:
-        if clean_text(
-            row.get("article_id")
-        ) == article_id:
-            return True
+    values = worksheet.get_all_values()
 
-    return False
+    if not values:
+        return None
+
+    headers = values[0]
+    mapping = header_map(headers)
+
+    article_id_index = mapping.get(
+        "article_id"
+    )
+
+    if article_id_index is None:
+        raise ValueError(
+            "Briefings sheet is missing "
+            "article_id column."
+        )
+
+    for row_number, row in enumerate(
+        values[1:],
+        start=2,
+    ):
+        if (
+            article_id_index < len(row)
+            and str(
+                row[article_id_index]
+            ).strip()
+            == str(article_id).strip()
+        ):
+            return {
+                "row_number": row_number,
+                "row": row,
+                "mapping": mapping,
+            }
+
+    return None
 
 
-def append_briefing(
+# ============================================================
+# SAVE BRIEFING
+# ============================================================
+
+def save_briefing(
     worksheet,
+    article,
     briefing,
+    model,
 ):
-    headers = worksheet.row_values(1)
+    created_at = datetime.now(
+        timezone.utc
+    ).isoformat()
 
-    row = []
+    row = [
+        normalize_cell(
+            article["article_id"]
+        ),
+        normalize_cell(
+            article["source"]
+        ),
+        normalize_cell(
+            article["title"]
+        ),
+        normalize_cell(
+            article["url"]
+        ),
+        normalize_cell(
+            article["published_at"]
+        ),
+        normalize_cell(
+            article["rule_score"]
+        ),
+        normalize_cell(
+            article["topics"]
+        ),
+        normalize_cell(
+            briefing["summary"]
+        ),
+        normalize_cell(
+            briefing["key_points"]
+        ),
+        normalize_cell(
+            briefing["why_it_matters"]
+        ),
+        normalize_cell(
+            briefing["implications"]
+        ),
+        normalize_cell(
+            model
+        ),
+        normalize_cell(
+            created_at
+        ),
+        "BRIEFED",
+    ]
 
-    for column in headers:
-        row.append(
-            briefing.get(
-                column,
-                "",
-            )
+    if len(row) != len(
+        BRIEFING_FIELDS
+    ):
+        raise ValueError(
+            "Briefing row has "
+            f"{len(row)} columns, "
+            f"expected "
+            f"{len(BRIEFING_FIELDS)}."
         )
 
     worksheet.append_row(
@@ -431,127 +708,122 @@ def append_briefing(
     )
 
 
-def update_article_status(
-    worksheet,
-    records,
-    article_id,
-    new_status,
+# ============================================================
+# PROCESS ARTICLES
+# ============================================================
+
+def process_articles(
+    spreadsheet,
+    client,
+    model,
+    prompt_template,
+    max_content_chars,
+    language,
 ):
-    headers = worksheet.row_values(1)
-
-    if "status" not in headers:
-        raise ValueError(
-            "Articles sheet has no status column."
+    articles_worksheet = (
+        spreadsheet.worksheet(
+            ARTICLES_SHEET
         )
-
-    status_column = (
-        headers.index("status") + 1
     )
 
-    for row_number, article in enumerate(
-        records,
-        start=2,
-    ):
-        current_id = clean_text(
-            article.get("article_id")
+    briefings_worksheet = (
+        spreadsheet.worksheet(
+            BRIEFINGS_SHEET
         )
+    )
 
-        if current_id != article_id:
-            continue
+    article_values = (
+        articles_worksheet.get_all_values()
+    )
 
-        cell = gspread.utils.rowcol_to_a1(
-            row_number,
-            status_column,
+    if not article_values:
+        print(
+            "[BRIEFING] "
+            "Articles sheet is empty."
         )
-
-        worksheet.update(
-            range_name=cell,
-            values=[[new_status]],
-        )
-
         return
 
+    article_headers = article_values[0]
 
-def main():
-    print(
-        "============================================================"
-    )
-    print(
-        "AI BRIEFING ENGINE v0.1"
-    )
-    print(
-        "============================================================"
+    article_mapping = header_map(
+        article_headers
     )
 
-    spreadsheet = get_spreadsheet()
-
-    print(
-        f"Connected to: "
-        f"{spreadsheet.title}"
-    )
-
-    settings = get_settings(
-        spreadsheet
-    )
-
-    model = settings[
-        "briefing_model"
+    required_fields = [
+        "article_id",
+        "source",
+        "title",
+        "url",
+        "published_at",
+        "rule_score",
+        "topics",
+        "status",
     ]
 
-    max_chars = settings[
-        "briefing_max_content_chars"
-    ]
+    for field in required_fields:
+        if field not in article_mapping:
+            raise ValueError(
+                "Articles sheet is missing "
+                f"column: {field}"
+            )
 
-    language = settings[
-        "briefing_language"
-    ]
+    selected = []
+
+    for row_number, row in enumerate(
+        article_values[1:],
+        start=2,
+    ):
+        status = row_value(
+            row,
+            article_mapping,
+            "status",
+        ).strip().upper()
+
+        if status != ARTICLE_STATUS_SELECTED:
+            continue
+
+        selected.append({
+            "row_number": row_number,
+            "article_id": row_value(
+                row,
+                article_mapping,
+                "article_id",
+            ),
+            "source": row_value(
+                row,
+                article_mapping,
+                "source",
+            ),
+            "title": row_value(
+                row,
+                article_mapping,
+                "title",
+            ),
+            "url": row_value(
+                row,
+                article_mapping,
+                "url",
+            ),
+            "published_at": row_value(
+                row,
+                article_mapping,
+                "published_at",
+            ),
+            "rule_score": row_value(
+                row,
+                article_mapping,
+                "rule_score",
+            ),
+            "topics": row_value(
+                row,
+                article_mapping,
+                "topics",
+            ),
+        })
 
     print(
-        f"[SETTINGS] model={model}"
-    )
-
-    print(
-        f"[SETTINGS] "
-        f"max_content_chars={max_chars}"
-    )
-
-    print(
-        f"[SETTINGS] "
-        f"language={language}"
-    )
-
-    articles_ws = spreadsheet.worksheet(
-        ARTICLES_SHEET
-    )
-
-    briefings_ws = spreadsheet.worksheet(
-        BRIEFINGS_SHEET
-    )
-
-    articles = get_articles(
-        articles_ws
-    )
-
-    briefings = get_briefings(
-        briefings_ws
-    )
-
-    ensure_briefing_columns(
-        briefings_ws
-    )
-
-    selected = [
-        article
-        for article in articles
-        if clean_text(
-            article.get("status")
-        ).upper()
-        == "SELECTED"
-    ]
-
-    print(
-        f"[BRIEFING] Selected articles: "
-        f"{len(selected)}"
+        f"[BRIEFING] "
+        f"Selected articles: {len(selected)}"
     )
 
     if not selected:
@@ -561,167 +833,218 @@ def main():
         )
         return
 
-    api_key = os.environ.get(
-        "OPENAI_API_KEY"
-    )
-
-    if not api_key:
-        raise RuntimeError(
-            "OPENAI_API_KEY is not configured."
-        )
-
-    client = OpenAI(
-        api_key=api_key
-    )
-
     successful = 0
     failed = 0
+    skipped = 0
 
     for article in selected:
-        article_id = clean_text(
-            article.get("article_id")
-        )
+        article_id = article[
+            "article_id"
+        ]
 
-        title = clean_text(
-            article.get("title")
-        )
+        title = article[
+            "title"
+        ]
+
+        url = article[
+            "url"
+        ]
 
         print()
         print(
             f"[BRIEFING] {title}"
         )
 
-        if briefing_exists(
-            briefings,
-            article_id,
-        ):
-            print(
-                "[BRIEFING] "
-                "Already exists. Skipping."
-            )
-            continue
+        # ----------------------------------------------------
+        # DUPLICATE CHECK
+        # ----------------------------------------------------
 
         try:
-            url = clean_text(
-                article.get("url")
+            existing = (
+                find_briefing_by_article_id(
+                    briefings_worksheet,
+                    article_id,
+                )
+            )
+        except Exception as exc:
+            print(
+                "[WARNING] Could not check "
+                f"existing briefing: {exc}"
+            )
+            existing = None
+
+        if existing:
+            mapping = existing[
+                "mapping"
+            ]
+
+            status_index = mapping.get(
+                "status"
             )
 
-            content = extract_article_content(
-                url,
-                max_chars,
+            existing_status = ""
+
+            if (
+                status_index is not None
+                and status_index
+                < len(existing["row"])
+            ):
+                existing_status = (
+                    existing["row"][
+                        status_index
+                    ]
+                    .strip()
+                    .upper()
+                )
+
+            if existing_status == "BRIEFED":
+                print(
+                    "[SKIP] "
+                    "Briefing already exists."
+                )
+
+                update_article_status(
+                    articles_worksheet,
+                    article["row_number"],
+                    article_mapping,
+                    ARTICLE_STATUS_BRIEFED,
+                )
+
+                skipped += 1
+                continue
+
+        try:
+            # ------------------------------------------------
+            # FETCH
+            # ------------------------------------------------
+
+            print(
+                f"[FETCH] {url}"
+            )
+
+            article_text = fetch_article(
+                url
+            )
+
+            if not article_text:
+                raise ValueError(
+                    "No article text extracted."
+                )
+
+            if len(article_text) > (
+                max_content_chars
+            ):
+                article_text = (
+                    article_text[
+                        :max_content_chars
+                    ]
+                )
+
+                print(
+                    "[FETCH] Content truncated "
+                    f"to {max_content_chars} "
+                    "characters."
+                )
+
+            print(
+                "[FETCH] "
+                f"{len(article_text)} "
+                "characters extracted."
+            )
+
+            # ------------------------------------------------
+            # AI
+            # ------------------------------------------------
+
+            print(
+                "[AI] Generating "
+                "structured briefing..."
+            )
+
+            briefing = generate_briefing(
+                client=client,
+                model=model,
+                prompt_template=prompt_template,
+                title=title,
+                source=article["source"],
+                topics=article["topics"],
+                article_text=article_text,
+                language=language,
             )
 
             print(
-                f"[FETCH] "
-                f"{len(content)} characters extracted."
+                "[AI] Structured briefing "
+                "generated."
             )
 
-            result = generate_briefing(
-                client,
-                model,
-                article,
-                content,
-                language,
-            )
+            # ------------------------------------------------
+            # VALIDATE
+            # ------------------------------------------------
 
-            created_at = (
-                datetime.now(
-                    timezone.utc
-                )
-                .isoformat()
-            )
-
-            briefing = {
-                "article_id": article_id,
-                "source": clean_text(
-                    article.get("source")
-                ),
-                "title": title,
-                "url": url,
-                "published_at": clean_text(
-                    article.get(
-                        "published_at"
-                    )
-                ),
-                "rule_score": clean_text(
-                    article.get(
-                        "rule_score"
-                    )
-                ),
-                "topics": clean_text(
-                    article.get(
-                        "matched_topics"
-                    )
-                ),
-                "summary": result.get(
-                    "summary",
-                    "",
-                ),
-                "key_points": result.get(
-                    "key_points",
-                    "",
-                ),
-                "why_it_matters": result.get(
-                    "why_it_matters",
-                    "",
-                ),
-                "implications": result.get(
-                    "implications",
-                    "",
-                ),
-                "model": model,
-                "created_at": created_at,
-                "status": "COMPLETED",
-            }
-
-            append_briefing(
-                briefings_ws,
-                briefing,
-            )
-
-            update_article_status(
-                articles_ws,
-                articles,
-                article_id,
-                "BRIEFED",
-            )
-
-            briefings.append(
+            validate_briefing(
                 briefing
             )
 
-            successful += 1
+            print(
+                "[VALIDATE] "
+                "Briefing schema OK."
+            )
+
+            # ------------------------------------------------
+            # SAVE
+            # ------------------------------------------------
+
+            save_briefing(
+                worksheet=briefings_worksheet,
+                article=article,
+                briefing=briefing,
+                model=model,
+            )
+
+            update_article_status(
+                articles_worksheet,
+                article["row_number"],
+                article_mapping,
+                ARTICLE_STATUS_BRIEFED,
+            )
 
             print(
-                "[BRIEFING] "
-                "Completed."
+                "[SAVE] "
+                "Briefing saved."
             )
+
+            successful += 1
 
         except Exception as exc:
             failed += 1
 
             print(
-                f"[ERROR] "
-                f"{title}: {exc}"
+                f"[ERROR] {title}: "
+                f"{type(exc).__name__}: {exc}"
             )
 
-            update_article_status(
-                articles_ws,
-                articles,
-                article_id,
-                "BRIEFING_ERROR",
-            )
+            try:
+                update_article_status(
+                    articles_worksheet,
+                    article["row_number"],
+                    article_mapping,
+                    ARTICLE_STATUS_BRIEFING_ERROR,
+                )
+            except Exception as status_exc:
+                print(
+                    "[ERROR] Could not update "
+                    "article status: "
+                    f"{status_exc}"
+                )
+
+        time.sleep(0.5)
 
     print()
-    print(
-        "============================================================"
-    )
+    print("=" * 60)
     print(
         "BRIEFING SUMMARY"
     )
-    print(
-        "============================================================"
-    )
+    print("=" * 60)
     print(
         f"Selected: {len(selected)}"
     )
@@ -732,7 +1055,128 @@ def main():
         f"Failed: {failed}"
     )
     print(
-        "============================================================"
+        f"Skipped: {skipped}"
+    )
+    print("=" * 60)
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+    print("=" * 60)
+    print(
+        f"AI BRIEFING ENGINE v{APP_VERSION}"
+    )
+    print("=" * 60)
+
+    spreadsheet = get_spreadsheet()
+
+    settings = load_settings(
+        spreadsheet
+    )
+
+    # --------------------------------------------------------
+    # MODEL
+    # --------------------------------------------------------
+
+    model = get_setting(
+        settings,
+        "briefing_model",
+        get_setting(
+            settings,
+            "model",
+            DEFAULT_MODEL,
+        ),
+    )
+
+    # --------------------------------------------------------
+    # LANGUAGE
+    # --------------------------------------------------------
+
+    language = get_setting(
+        settings,
+        "briefing_language",
+        get_setting(
+            settings,
+            "language",
+            DEFAULT_LANGUAGE,
+        ),
+    )
+
+    # --------------------------------------------------------
+    # CONTENT LIMIT
+    # --------------------------------------------------------
+
+    max_content_chars = (
+        get_int_setting(
+            settings,
+            "briefing_max_content_chars",
+            get_int_setting(
+                settings,
+                "max_content_chars",
+                DEFAULT_MAX_CONTENT_CHARS,
+            ),
+        )
+    )
+
+    # --------------------------------------------------------
+    # PROMPT
+    # --------------------------------------------------------
+
+    prompt_template = get_setting(
+        settings,
+        "briefing_prompt",
+        DEFAULT_BRIEFING_PROMPT,
+    )
+
+    if not prompt_template.strip():
+        raise ValueError(
+            "Settings.briefing_prompt "
+            "is empty."
+        )
+
+    # --------------------------------------------------------
+    # LOG SETTINGS
+    # --------------------------------------------------------
+
+    print(
+        f"[SETTINGS] model={model}"
+    )
+
+    print(
+        "[SETTINGS] "
+        f"max_content_chars="
+        f"{max_content_chars}"
+    )
+
+    print(
+        f"[SETTINGS] language={language}"
+    )
+
+    print(
+        "[SETTINGS] "
+        "prompt=loaded from Settings"
+    )
+
+    # --------------------------------------------------------
+    # OPENAI
+    # --------------------------------------------------------
+
+    client = get_openai_client()
+
+    # --------------------------------------------------------
+    # PROCESS
+    # --------------------------------------------------------
+
+    process_articles(
+        spreadsheet=spreadsheet,
+        client=client,
+        model=model,
+        prompt_template=prompt_template,
+        max_content_chars=max_content_chars,
+        language=language,
     )
 
 
