@@ -30,3 +30,6 @@ jobs:
           GOOGLE_SPREADSHEET_ID: ${{ secrets.GOOGLE_SPREADSHEET_ID }}
         run: |
           python rule_engine.py
+
+      - name: Run selection engine
+        run: python selection_engine.py
