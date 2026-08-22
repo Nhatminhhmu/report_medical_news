@@ -1,38 +1,79 @@
+"""
+AI Briefing Engine v0.6
+Medical News Report
+
+Pipeline:
+    Articles
+        ↓
+    Selection
+        ↓
+    Briefing Engine
+        ↓
+    Briefings
+
+Responsibilities:
+- Load selected articles
+- Fetch article content
+- Fallback to Articles.excerpt when source blocks crawling
+- Load active Reading Metrics dynamically from Google Sheets
+- Call OpenAI once per article
+- Generate:
+    * summary
+    * key_points
+    * why_it_matters
+    * implications
+    * metric scores
+    * metric reasons
+- Calculate weighted reading_score locally
+- Store results in Briefings
+
+Design goals:
+- 1 OpenAI call / article
+- No hard-coded Reading Metrics
+- Structured Outputs
+- Skip already successful briefings
+- Minimize article content sent to API
+- Batch Google Sheets writes where possible
+"""
+
+from __future__ import annotations
+
+import json
 import os
 import re
-import json
 import time
-import html
 from datetime import datetime, timezone
+from typing import Any
+from urllib.parse import urlparse
 
-import requests
 import gspread
+import requests
+from bs4 import BeautifulSoup
 from google.oauth2.service_account import Credentials
 from openai import OpenAI
 
 
 # ============================================================
-# AI BRIEFING ENGINE
+# CONFIG
 # ============================================================
 
-VERSION = "0.5"
-
-ARTICLES_SHEET = "Articles"
-BRIEFINGS_SHEET = "Briefings"
-SETTINGS_SHEET = "Settings"
+VERSION = "0.6"
 
 DEFAULT_MODEL = "gpt-5.6-luna"
 DEFAULT_LANGUAGE = "Vietnamese"
-# Cost-conscious default. Override in Settings when needed.
 DEFAULT_MAX_CONTENT_CHARS = 30000
-DEFAULT_TEMPERATURE = 1.0
+DEFAULT_REASONING_EFFORT = "low"
+DEFAULT_MAX_OUTPUT_TOKENS = 1400
 
-REQUEST_TIMEOUT = 30
+BRIEFINGS_SHEET = "Briefings"
+ARTICLES_SHEET = "Articles"
+SELECTION_SHEET = "Selection"
+METRICS_SHEET = "Reading Metrics"
 
-# Deliberately conservative: avoid paying for repeated failed requests.
-# We retry only transient transport failures, not OpenAI 4xx/API quota errors.
-OPENAI_RETRY_COUNT = 1
-OPENAI_RETRY_DELAY = 2
+GOOGLE_SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -40,435 +81,14 @@ USER_AGENT = (
     "Chrome/151.0 Safari/537.36"
 )
 
-BLOCKED_STATUS_CODES = {401, 402, 403, 404, 405, 406, 407, 410, 451}
-NON_RETRYABLE_OPENAI_MARKERS = (
-    "400",
-    "401",
-    "402",
-    "403",
-    "404",
-    "409",
-    "429",
-    "insufficient_quota",
-    "invalid_request_error",
-    "unsupported value",
-    "unsupported_value",
-)
+REQUEST_TIMEOUT = 20
 
 
 # ============================================================
-# GOOGLE SHEETS
+# BRIEFINGS SCHEMA
 # ============================================================
 
-def get_spreadsheet():
-    credentials_json = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
-    spreadsheet_id = os.environ["GOOGLE_SPREADSHEET_ID"]
-
-    credentials = Credentials.from_service_account_info(
-        json.loads(credentials_json),
-        scopes=[
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive",
-        ],
-    )
-
-    client = gspread.authorize(credentials)
-    spreadsheet = client.open_by_key(spreadsheet_id)
-
-    print(f"Connected to: {spreadsheet.title}")
-    return spreadsheet
-
-
-def get_worksheet(spreadsheet, name):
-    return spreadsheet.worksheet(name)
-
-
-def row_value(row, key, default=""):
-    value = row.get(key, default)
-    if value is None:
-        return default
-    return str(value).strip()
-
-
-# ============================================================
-# SETTINGS
-# ============================================================
-
-def load_settings(spreadsheet):
-    worksheet = get_worksheet(spreadsheet, SETTINGS_SHEET)
-    records = worksheet.get_all_records()
-
-    settings = {}
-    for record in records:
-        key = str(record.get("key", "")).strip()
-        if not key:
-            continue
-        settings[key] = record.get("value", "")
-
-    return settings
-
-
-def setting(settings, key, default=None):
-    value = settings.get(key)
-
-    if value is None:
-        return default
-
-    if isinstance(value, str):
-        value = value.strip()
-        if not value:
-            return default
-
-    return value
-
-
-def setting_int(settings, key, default):
-    value = setting(settings, key, default)
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def setting_float(settings, key, default):
-    value = setting(settings, key, default)
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
-
-
-# ============================================================
-# TEXT CLEANING
-# ============================================================
-
-def clean_text(text):
-    if not text:
-        return ""
-
-    text = html.unescape(str(text))
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
-
-
-def html_to_text(content):
-    try:
-        from bs4 import BeautifulSoup
-
-        soup = BeautifulSoup(content, "html.parser")
-
-        for tag in soup(
-            [
-                "script",
-                "style",
-                "noscript",
-                "svg",
-                "nav",
-                "footer",
-                "header",
-                "form",
-            ]
-        ):
-            tag.decompose()
-
-        lines = []
-        for line in soup.get_text("\n").splitlines():
-            line = clean_text(line)
-            if line:
-                lines.append(line)
-
-        return "\n".join(lines)
-
-    except Exception:
-        content = re.sub(r"<[^>]+>", " ", content)
-        return clean_text(content)
-
-
-# ============================================================
-# FETCH ARTICLE
-# ============================================================
-
-def fetch_article(url):
-    """
-    Returns:
-        (content, fetch_status)
-
-    fetch_status is one of:
-        full
-        blocked
-        not_found
-        error
-    """
-    if not url:
-        return "", "error"
-
-    headers = {
-        "User-Agent": USER_AGENT,
-        "Accept": (
-            "text/html,application/xhtml+xml,"
-            "application/xml;q=0.9,"
-            "image/avif,image/webp,*/*;q=0.8"
-        ),
-        "Accept-Language": "en-US,en;q=0.9",
-        "Cache-Control": "no-cache",
-    }
-
-    try:
-        response = requests.get(
-            url,
-            headers=headers,
-            timeout=REQUEST_TIMEOUT,
-            allow_redirects=True,
-        )
-
-        if response.status_code in BLOCKED_STATUS_CODES:
-            return "", "blocked"
-
-        response.raise_for_status()
-
-        content = html_to_text(response.text)
-
-        if not content:
-            return "", "error"
-
-        return content, "full"
-
-    except requests.HTTPError as exc:
-        status = getattr(exc.response, "status_code", None)
-
-        if status in BLOCKED_STATUS_CODES:
-            return "", "blocked"
-
-        return "", "error"
-
-    except requests.RequestException:
-        return "", "error"
-
-
-# ============================================================
-# OPENAI
-# ============================================================
-
-def get_openai_client():
-    api_key = os.environ.get("OPENAI_API_KEY")
-
-    if not api_key:
-        raise RuntimeError(
-            "Missing OPENAI_API_KEY environment variable."
-        )
-
-    return OpenAI(api_key=api_key)
-
-
-def extract_json(text):
-    if not text:
-        raise ValueError("OpenAI returned empty response.")
-
-    text = text.strip()
-
-    # Remove markdown code fences if the model adds them.
-    text = re.sub(
-        r"^```(?:json)?\s*",
-        "",
-        text,
-        flags=re.IGNORECASE,
-    )
-    text = re.sub(
-        r"\s*```$",
-        "",
-        text,
-        flags=re.IGNORECASE,
-    ).strip()
-
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-
-    # Conservative fallback for a JSON object embedded in text.
-    start = text.find("{")
-    end = text.rfind("}")
-
-    if start >= 0 and end > start:
-        candidate = text[start : end + 1]
-        try:
-            return json.loads(candidate)
-        except json.JSONDecodeError:
-            pass
-
-    raise ValueError("OpenAI returned invalid JSON.")
-
-
-def is_non_retryable_openai_error(exc):
-    message = str(exc).lower()
-
-    return any(
-        marker.lower() in message
-        for marker in NON_RETRYABLE_OPENAI_MARKERS
-    )
-
-
-def call_openai(
-    client,
-    model,
-    system_prompt,
-    user_prompt,
-    temperature=DEFAULT_TEMPERATURE,
-):
-    """
-    Cost-control policy:
-    - No retry for OpenAI 4xx errors, quota errors, or invalid requests.
-    - At most one retry for transient/non-classified failures.
-    """
-    last_error = None
-
-    for attempt in range(OPENAI_RETRY_COUNT + 1):
-        try:
-            response = client.chat.completions.create(
-                model=model,
-                temperature=temperature,
-                response_format={"type": "json_object"},
-                messages=[
-                    {
-                        "role": "system",
-                        "content": system_prompt,
-                    },
-                    {
-                        "role": "user",
-                        "content": user_prompt,
-                    },
-                ],
-            )
-
-            content = response.choices[0].message.content
-            return extract_json(content)
-
-        except Exception as exc:
-            last_error = exc
-
-            if is_non_retryable_openai_error(exc):
-                raise
-
-            if attempt < OPENAI_RETRY_COUNT:
-                time.sleep(OPENAI_RETRY_DELAY)
-            else:
-                raise last_error
-
-
-# ============================================================
-# DEFAULT PROMPT
-# ============================================================
-
-DEFAULT_SYSTEM_PROMPT = """
-You are a senior healthcare management and healthcare technology analyst.
-
-Analyze the supplied healthcare article carefully.
-
-Return ONLY valid JSON.
-
-The analysis must be factual and grounded strictly in the supplied article.
-Do not invent facts, numbers, quotes, organizations, outcomes, or implications.
-
-Write the output in Vietnamese.
-
-Required JSON structure:
-
-{
-  "summary": "A concise executive summary.",
-  "key_points": [
-    "Key point 1",
-    "Key point 2",
-    "Key point 3"
-  ],
-  "why_it_matters": "Why this article matters to healthcare leaders.",
-  "implications": [
-    "Implication 1",
-    "Implication 2",
-    "Implication 3"
-  ]
-}
-
-Keep the analysis practical and relevant to healthcare management,
-hospital operations, strategy, digital health, patient experience,
-workforce, finance, and clinical operations when applicable.
-
-Do not force relevance if the article does not support it.
-
-If the supplied material is only an excerpt rather than the full article,
-explicitly limit conclusions to what the excerpt supports.
-"""
-
-
-DEFAULT_USER_PROMPT = """
-Source: {source}
-Title: {title}
-URL: {url}
-Published at: {published_at}
-Rule score: {rule_score}
-Topics: {topics}
-Content source: {content_source}
-
-ARTICLE MATERIAL:
-{content}
-"""
-
-
-def build_prompt(settings, article, content, content_source, language):
-    system_prompt = setting(
-        settings,
-        "briefing_system_prompt",
-        DEFAULT_SYSTEM_PROMPT,
-    )
-
-    user_template = setting(
-        settings,
-        "briefing_user_prompt",
-        DEFAULT_USER_PROMPT,
-    )
-
-    variables = {
-        "source": article["source"],
-        "title": article["title"],
-        "url": article["url"],
-        "published_at": article["published_at"],
-        "rule_score": article["rule_score"],
-        "topics": article["topics"],
-        "content_source": content_source,
-        "content": content,
-        "language": language,
-    }
-
-    try:
-        user_prompt = user_template.format(**variables)
-    except (KeyError, ValueError):
-        # Do not silently fail because of a malformed configurable prompt.
-        # Use the safe default instead.
-        user_prompt = DEFAULT_USER_PROMPT.format(**variables)
-
-    return system_prompt, user_prompt
-
-
-# ============================================================
-# SHEET SCHEMA
-# ============================================================
-
-ARTICLES_HEADERS = [
-    "article_id",
-    "source",
-    "title",
-    "url",
-    "published_at",
-    "excerpt",
-    "matched_topics",
-    "matched_related_terms",
-    "matched_context_terms",
-    "rule_score",
-    "matched_keywords",
-    "status",
-    "discovered_at",
-]
-
-BRIEFINGS_HEADERS = [
+BRIEFING_HEADERS = [
     "article_id",
     "source",
     "title",
@@ -480,414 +100,1284 @@ BRIEFINGS_HEADERS = [
     "key_points",
     "why_it_matters",
     "implications",
+
+    "metric_1_score",
+    "metric_1_reason",
+    "metric_2_score",
+    "metric_2_reason",
+    "metric_3_score",
+    "metric_3_reason",
+    "metric_4_score",
+    "metric_4_reason",
+    "metric_5_score",
+    "metric_5_reason",
+
+    "reading_score",
+    "rank",
+    "selected",
     "model",
     "created_at",
     "status",
 ]
 
 
-def validate_articles_schema(worksheet):
-    headers = worksheet.row_values(1)
+# ============================================================
+# HELPERS
+# ============================================================
 
-    missing = [
-        header
-        for header in ARTICLES_HEADERS
-        if header not in headers
-    ]
-
-    if missing:
-        raise ValueError(
-            "Articles sheet is missing columns: "
-            + ", ".join(missing)
-        )
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
-def ensure_briefings_schema(worksheet):
-    headers = worksheet.row_values(1)
+def normalize_bool(value: Any) -> bool:
+    return str(value).strip().lower() in {
+        "true",
+        "1",
+        "yes",
+        "y",
+        "active",
+    }
 
-    if not headers:
-        worksheet.update(
-            range_name="A1",
-            values=[BRIEFINGS_HEADERS],
-        )
-        return
 
-    missing = [
-        header
-        for header in BRIEFINGS_HEADERS
-        if header not in headers
-    ]
+def safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        return default
 
-    if missing:
-        raise ValueError(
-            "Briefings sheet is missing columns: "
-            + ", ".join(missing)
-        )
+
+def clean_text(value: Any) -> str:
+    if value is None:
+        return ""
+
+    text = str(value)
+
+    text = text.replace("\x00", " ")
+    text = re.sub(r"\s+", " ", text)
+
+    return text.strip()
+
+
+def truncate_text(text: str, max_chars: int) -> str:
+    text = clean_text(text)
+
+    if len(text) <= max_chars:
+        return text
+
+    # Keep a little room for a clear truncation marker.
+    return text[: max_chars - 80].rstrip() + "\n\n[CONTENT TRUNCATED]"
+
+
+def parse_json_safely(text: str) -> dict:
+    """
+    Structured Outputs should already return valid JSON.
+    This fallback exists only for defensive robustness.
+    """
+
+    if not text:
+        raise ValueError("OpenAI returned empty output.")
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Defensive extraction if SDK returns surrounding text.
+    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+
+    if match:
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError:
+            pass
+
+    raise ValueError("OpenAI returned invalid JSON.")
 
 
 # ============================================================
-# ARTICLE LOADING
+# GOOGLE SHEETS
 # ============================================================
 
-def load_selected_articles(spreadsheet):
+def get_spreadsheet():
+    credentials_json = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
+    spreadsheet_id = os.environ["GOOGLE_SPREADSHEET_ID"]
+
+    credentials_info = json.loads(credentials_json)
+
+    credentials = Credentials.from_service_account_info(
+        credentials_info,
+        scopes=GOOGLE_SCOPES,
+    )
+
+    client = gspread.authorize(credentials)
+
+    spreadsheet = client.open_by_key(spreadsheet_id)
+
+    print(f"Connected to: {spreadsheet.title}")
+
+    return spreadsheet
+
+
+def get_worksheet(spreadsheet, name: str):
+    try:
+        return spreadsheet.worksheet(name)
+    except gspread.WorksheetNotFound:
+        return None
+
+
+def get_records(worksheet):
+    if worksheet is None:
+        return []
+
+    return worksheet.get_all_records()
+
+
+# ============================================================
+# SETTINGS
+# ============================================================
+
+def load_settings(spreadsheet) -> dict[str, str]:
     """
-    Selection is represented directly in Articles.status.
-    No Selection sheet is required.
+    Supports common Settings layouts.
+
+    Preferred:
+        setting_key | setting_value
+
+    Also accepts:
+        key | value
+        parameter | value
+
+    The function intentionally does not hard-code the rest of
+    the application configuration.
     """
-    worksheet = spreadsheet.worksheet(ARTICLES_SHEET)
-    validate_articles_schema(worksheet)
+
+    worksheet = get_worksheet(spreadsheet, "Settings")
+
+    if worksheet is None:
+        print("[SETTINGS] Settings sheet not found; using defaults.")
+        return {}
 
     records = worksheet.get_all_records()
 
+    if not records:
+        return {}
+
+    headers = [
+        clean_text(h).lower()
+        for h in records[0].keys()
+    ]
+
+    key_candidates = [
+        "setting_key",
+        "key",
+        "parameter",
+        "setting",
+        "name",
+    ]
+
+    value_candidates = [
+        "setting_value",
+        "value",
+        "parameter_value",
+    ]
+
+    key_column = next(
+        (x for x in key_candidates if x in headers),
+        None,
+    )
+
+    value_column = next(
+        (x for x in value_candidates if x in headers),
+        None,
+    )
+
+    if not key_column or not value_column:
+        print(
+            "[SETTINGS] Could not identify key/value columns; "
+            "using defaults."
+        )
+        return {}
+
+    # Map original headers back to exact names.
+    original_headers = list(records[0].keys())
+
+    key_header = next(
+        h for h in original_headers
+        if clean_text(h).lower() == key_column
+    )
+
+    value_header = next(
+        h for h in original_headers
+        if clean_text(h).lower() == value_column
+    )
+
+    settings = {}
+
+    for row in records:
+        key = clean_text(row.get(key_header)).lower()
+
+        if not key:
+            continue
+
+        settings[key] = clean_text(row.get(value_header))
+
+    return settings
+
+
+def setting(settings: dict, key: str, default: Any) -> Any:
+    value = settings.get(key.lower())
+
+    if value in (None, ""):
+        return default
+
+    return value
+
+
+# ============================================================
+# READING METRICS
+# ============================================================
+
+def load_reading_metrics(spreadsheet) -> list[dict]:
+    worksheet = get_worksheet(spreadsheet, METRICS_SHEET)
+
+    if worksheet is None:
+        raise ValueError(
+            f"'{METRICS_SHEET}' sheet was not found."
+        )
+
+    records = worksheet.get_all_records()
+
+    metrics = []
+
+    for row in records:
+        if not normalize_bool(row.get("active")):
+            continue
+
+        metric_id = clean_text(row.get("metric_id"))
+
+        if not metric_id:
+            continue
+
+        metric_name = clean_text(row.get("metric_name"))
+        description = clean_text(row.get("metric_description"))
+        guidance = clean_text(row.get("evaluation_guidance"))
+        weight = safe_float(row.get("weight"))
+
+        if not metric_name:
+            continue
+
+        if weight <= 0:
+            continue
+
+        metrics.append(
+            {
+                "metric_id": metric_id,
+                "metric_name": metric_name,
+                "metric_description": description,
+                "weight": weight,
+                "evaluation_guidance": guidance,
+            }
+        )
+
+    if not metrics:
+        raise ValueError(
+            "No active Reading Metrics were found."
+        )
+
+    total_weight = sum(m["weight"] for m in metrics)
+
+    if total_weight <= 0:
+        raise ValueError(
+            "Reading Metrics total weight must be greater than 0."
+        )
+
+    # We do not require total weight = 100.
+    # Normalization makes the system tolerant of future changes.
+    for metric in metrics:
+        metric["normalized_weight"] = (
+            metric["weight"] / total_weight
+        )
+
+    return metrics
+
+
+# ============================================================
+# OPENAI
+# ============================================================
+
+def get_openai_client():
+    api_key = os.environ["OPENAI_API_KEY"]
+
+    return OpenAI(api_key=api_key)
+
+
+def build_metric_schema(metrics: list[dict]) -> dict:
+    """
+    Dynamic Structured Output schema.
+
+    Every active metric becomes:
+        metric_X_score
+        metric_X_reason
+    """
+
+    properties = {
+        "summary": {
+            "type": "string",
+        },
+        "key_points": {
+            "type": "array",
+            "items": {
+                "type": "string",
+            },
+            "minItems": 2,
+            "maxItems": 5,
+        },
+        "why_it_matters": {
+            "type": "string",
+        },
+        "implications": {
+            "type": "string",
+        },
+    }
+
+    required = [
+        "summary",
+        "key_points",
+        "why_it_matters",
+        "implications",
+    ]
+
+    for metric in metrics:
+        metric_id = metric["metric_id"]
+
+        properties[f"{metric_id}_score"] = {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 100,
+        }
+
+        properties[f"{metric_id}_reason"] = {
+            "type": "string",
+        }
+
+        required.extend(
+            [
+                f"{metric_id}_score",
+                f"{metric_id}_reason",
+            ]
+        )
+
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": required,
+        "additionalProperties": False,
+    }
+
+
+def build_system_prompt(
+    metrics: list[dict],
+    custom_prompt: str,
+    language: str,
+) -> str:
+
+    metric_instructions = []
+
+    for metric in metrics:
+        metric_instructions.append(
+            f"""
+METRIC ID: {metric['metric_id']}
+NAME: {metric['metric_name']}
+DESCRIPTION: {metric['metric_description']}
+EVALUATION GUIDANCE: {metric['evaluation_guidance']}
+WEIGHT: {metric['weight']}
+""".strip()
+        )
+
+    metrics_text = "\n\n".join(metric_instructions)
+
+    base_prompt = f"""
+You are the medical and healthcare management intelligence layer
+of a personal Medical News Report system.
+
+Your task is to read ONE article and produce:
+1. A concise Vietnamese briefing.
+2. Key points.
+3. Why the article matters.
+4. Practical implications.
+5. A 0-100 score for every active Reading Metric.
+
+LANGUAGE:
+{language}
+
+READING METRICS:
+{metrics_text}
+
+SCORING RULES:
+- Score every metric independently from 0 to 100.
+- Use the metric description and evaluation guidance exactly.
+- Do not infer a high score merely because the article is recent.
+- Do not reward generic healthcare content automatically.
+- Evaluate the actual content of the article.
+- Keep metric reasons concise: preferably one or two sentences.
+- Do not calculate weighted score. The application calculates it.
+- Do not invent facts that are absent from the article.
+- Distinguish facts from reasonable implications.
+- If the article is weak or mostly promotional, score accordingly.
+
+BRIEFING RULES:
+- summary: concise, factual.
+- key_points: 2-5 important points.
+- why_it_matters: explain the significance for the reader.
+- implications: focus on hospital / healthcare management implications
+  when relevant.
+- Avoid generic filler.
+- Do not repeat the article title.
+- Do not mention that you are an AI.
+"""
+
+    custom_prompt = clean_text(custom_prompt)
+
+    if custom_prompt:
+        base_prompt += (
+            "\n\nADDITIONAL CONFIGURED INSTRUCTIONS:\n"
+            + custom_prompt
+        )
+
+    return base_prompt.strip()
+
+
+def build_article_input(
+    title: str,
+    source: str,
+    topics: str,
+    content: str,
+) -> str:
+
+    return f"""
+ARTICLE TITLE:
+{title}
+
+SOURCE:
+{source}
+
+TOPICS IDENTIFIED BY RULE ENGINE:
+{topics or "None"}
+
+ARTICLE CONTENT:
+{content}
+""".strip()
+
+
+def call_openai(
+    client: OpenAI,
+    model: str,
+    reasoning_effort: str,
+    system_prompt: str,
+    article_input: str,
+    schema: dict,
+    max_output_tokens: int,
+):
+
+    response = client.responses.create(
+        model=model,
+        reasoning={
+            "effort": reasoning_effort,
+        },
+        instructions=system_prompt,
+        input=article_input,
+        text={
+            "format": {
+                "type": "json_schema",
+                "name": "medical_news_briefing",
+                "strict": True,
+                "schema": schema,
+            }
+        },
+        max_output_tokens=max_output_tokens,
+        store=False,
+        prompt_cache_key="medical-news-briefing-v06",
+    )
+
+    return parse_json_safely(response.output_text)
+
+
+# ============================================================
+# ARTICLE FETCHING
+# ============================================================
+
+def extract_article_text(html: str) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+
+    # Remove non-content elements.
+    for tag in soup(
+        [
+            "script",
+            "style",
+            "noscript",
+            "svg",
+            "nav",
+            "footer",
+            "header",
+            "aside",
+            "form",
+        ]
+    ):
+        tag.decompose()
+
+    candidates = []
+
+    selectors = [
+        "article",
+        "[itemprop='articleBody']",
+        ".article-body",
+        ".article-content",
+        ".entry-content",
+        ".post-content",
+        "main",
+    ]
+
+    for selector in selectors:
+        for node in soup.select(selector):
+            text = node.get_text(" ", strip=True)
+
+            if len(text) > 500:
+                candidates.append(text)
+
+    if candidates:
+        return max(candidates, key=len)
+
+    return soup.get_text(" ", strip=True)
+
+
+def fetch_article_content(
+    url: str,
+    excerpt: str,
+    max_chars: int,
+) -> tuple[str, str]:
+
+    url = clean_text(url)
+    excerpt = clean_text(excerpt)
+
+    if not url:
+        if excerpt:
+            return truncate_text(excerpt, max_chars), "excerpt_fallback"
+
+        return "", "none"
+
+    try:
+        response = requests.get(
+            url,
+            headers={
+                "User-Agent": USER_AGENT,
+                "Accept": (
+                    "text/html,application/xhtml+xml,"
+                    "application/xml;q=0.9,*/*;q=0.8"
+                ),
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+            timeout=REQUEST_TIMEOUT,
+            allow_redirects=True,
+        )
+
+        response.raise_for_status()
+
+        content_type = response.headers.get(
+            "content-type",
+            "",
+        ).lower()
+
+        if "text/html" not in content_type:
+            raise ValueError(
+                f"Unsupported content type: {content_type}"
+            )
+
+        text = extract_article_text(response.text)
+        text = clean_text(text)
+
+        if len(text) < 300:
+            raise ValueError(
+                "Extracted article content is too short."
+            )
+
+        text = truncate_text(text, max_chars)
+
+        return text, "full_content"
+
+    except Exception as exc:
+        print(
+            f"[FETCH] blocked/unavailable: "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+        if excerpt:
+            excerpt = truncate_text(
+                excerpt,
+                max_chars,
+            )
+
+            print(
+                f"[FALLBACK] Using Articles.excerpt "
+                f"({len(excerpt)} characters)."
+            )
+
+            return excerpt, "excerpt_fallback"
+
+        return "", "none"
+
+
+# ============================================================
+# SELECTION
+# ============================================================
+
+def get_selected_articles(spreadsheet) -> list[dict]:
+
+    worksheet = get_worksheet(
+        spreadsheet,
+        SELECTION_SHEET,
+    )
+
+    if worksheet is not None:
+        records = worksheet.get_all_records()
+
+        if records:
+            return records
+
+    # Fallback:
+    # allow the engine to work without a Selection sheet.
+    articles_sheet = get_worksheet(
+        spreadsheet,
+        ARTICLES_SHEET,
+    )
+
+    if articles_sheet is None:
+        raise ValueError(
+            "Neither Selection nor Articles sheet was found."
+        )
+
+    records = articles_sheet.get_all_records()
+
     selected = []
 
-    for record in records:
-        status = row_value(record, "status").upper()
+    for row in records:
+        selected_value = row.get("selected")
 
-        if status == "SELECTED":
-            selected.append(record)
+        status = clean_text(
+            row.get("status")
+        ).lower()
+
+        if normalize_bool(selected_value):
+            selected.append(row)
+        elif status in {
+            "selected",
+            "briefing",
+            "ready",
+        }:
+            selected.append(row)
 
     return selected
-
-
-# ============================================================
-# ARTICLE NORMALIZATION
-# ============================================================
-
-def normalize_article(record):
-    return {
-        "article_id": row_value(record, "article_id"),
-        "source": row_value(record, "source"),
-        "title": row_value(record, "title"),
-        "url": row_value(record, "url"),
-        "published_at": row_value(record, "published_at"),
-        "excerpt": row_value(record, "excerpt"),
-        "rule_score": row_value(record, "rule_score"),
-        "topics": row_value(record, "matched_topics"),
-    }
 
 
 # ============================================================
 # EXISTING BRIEFINGS
 # ============================================================
 
-def get_existing_briefing_ids(worksheet):
-    records = worksheet.get_all_records()
+def load_existing_briefings(
+    worksheet,
+) -> dict[str, tuple[int, dict]]:
 
-    ids = set()
+    if worksheet is None:
+        return {}
 
-    for record in records:
-        article_id = row_value(record, "article_id")
+    values = worksheet.get_all_values()
 
-        if article_id:
-            ids.add(article_id)
+    if not values:
+        return {}
 
-    return ids
+    headers = values[0]
+
+    try:
+        article_index = headers.index("article_id")
+    except ValueError:
+        return {}
+
+    result = {}
+
+    for row_number, row in enumerate(
+        values[1:],
+        start=2,
+    ):
+        if article_index >= len(row):
+            continue
+
+        article_id = clean_text(
+            row[article_index]
+        )
+
+        if not article_id:
+            continue
+
+        row_dict = {
+            headers[i]: row[i]
+            for i in range(
+                min(len(headers), len(row))
+            )
+        }
+
+        result[article_id] = (
+            row_number,
+            row_dict,
+        )
+
+    return result
+
+
+def is_successful_briefing(row: dict) -> bool:
+    status = clean_text(
+        row.get("status")
+    ).lower()
+
+    return status in {
+        "success",
+        "successful",
+        "completed",
+    }
 
 
 # ============================================================
-# OUTPUT HELPERS
+# SCORE CALCULATION
 # ============================================================
 
-def normalize_list(value):
-    if value is None:
-        return []
+def calculate_reading_score(
+    result: dict,
+    metrics: list[dict],
+) -> float:
 
-    if isinstance(value, list):
-        return [
-            str(item).strip()
-            for item in value
-            if str(item).strip()
-        ]
+    weighted_total = 0.0
+    total_weight = 0.0
 
-    if isinstance(value, str):
-        value = value.strip()
+    for metric in metrics:
+        metric_id = metric["metric_id"]
 
-        if not value:
-            return []
+        score = safe_float(
+            result.get(
+                f"{metric_id}_score"
+            )
+        )
 
-        return [value]
+        score = max(
+            0.0,
+            min(100.0, score),
+        )
 
-    return [str(value).strip()]
+        weighted_total += (
+            score * metric["weight"]
+        )
 
+        total_weight += metric["weight"]
 
-def list_to_sheet_value(value):
-    return "\n".join(
-        f"• {item}"
-        for item in normalize_list(value)
+    if total_weight == 0:
+        return 0.0
+
+    return round(
+        weighted_total / total_weight,
+        2,
     )
 
 
-def safe_result_value(result, key, default=""):
-    value = result.get(key, default)
+# ============================================================
+# BRIEFING ROW
+# ============================================================
 
-    if value is None:
-        return default
+def build_briefing_row(
+    article: dict,
+    result: dict,
+    metrics: list[dict],
+    model: str,
+) -> list:
 
-    return value
+    metric_map = {
+        m["metric_id"]: m
+        for m in metrics
+    }
 
+    reading_score = calculate_reading_score(
+        result,
+        metrics,
+    )
 
-def create_briefing_row(article, result, model):
-    created_at = datetime.now(timezone.utc).isoformat()
+    row = {
+        "article_id": clean_text(
+            article.get("article_id")
+        ),
+        "source": clean_text(
+            article.get("source")
+        ),
+        "title": clean_text(
+            article.get("title")
+        ),
+        "url": clean_text(
+            article.get("url")
+        ),
+        "published_at": clean_text(
+            article.get("published_at")
+        ),
+        "rule_score": clean_text(
+            article.get("rule_score")
+        ),
+        "topics": clean_text(
+            article.get("matched_topics")
+            or article.get("topics")
+        ),
+        "summary": clean_text(
+            result.get("summary")
+        ),
+        "key_points": "\n".join(
+            f"• {clean_text(x)}"
+            for x in result.get(
+                "key_points",
+                [],
+            )
+            if clean_text(x)
+        ),
+        "why_it_matters": clean_text(
+            result.get("why_it_matters")
+        ),
+        "implications": clean_text(
+            result.get("implications")
+        ),
+        "reading_score": reading_score,
+        "rank": "",
+        "selected": "",
+        "model": model,
+        "created_at": now_iso(),
+        "status": "success",
+    }
+
+    # Always populate all five schema slots.
+    #
+    # Active metrics are dynamic, but Briefings is fixed to
+    # metric_1 ... metric_5 as previously agreed.
+    for i in range(1, 6):
+        metric_id = f"metric_{i}"
+
+        if metric_id in metric_map:
+            row[
+                f"{metric_id}_score"
+            ] = safe_float(
+                result.get(
+                    f"{metric_id}_score"
+                )
+            )
+
+            row[
+                f"{metric_id}_reason"
+            ] = clean_text(
+                result.get(
+                    f"{metric_id}_reason"
+                )
+            )
+        else:
+            row[
+                f"{metric_id}_score"
+            ] = ""
+
+            row[
+                f"{metric_id}_reason"
+            ] = ""
 
     return [
-        article["article_id"],
-        article["source"],
-        article["title"],
-        article["url"],
-        article["published_at"],
-        article["rule_score"],
-        article["topics"],
-        str(
-            safe_result_value(result, "summary", "")
-        ).strip(),
-        list_to_sheet_value(
-            safe_result_value(result, "key_points", [])
-        ),
-        str(
-            safe_result_value(result, "why_it_matters", "")
-        ).strip(),
-        list_to_sheet_value(
-            safe_result_value(result, "implications", [])
-        ),
-        model,
-        created_at,
-        "COMPLETED",
+        row.get(header, "")
+        for header in BRIEFING_HEADERS
     ]
 
 
 # ============================================================
-# ARTICLE STATUS UPDATE
+# SHEET WRITING
 # ============================================================
 
-def update_article_status(worksheet, article_id, new_status):
-    headers = worksheet.row_values(1)
+def ensure_briefings_header(worksheet):
 
-    try:
-        article_id_col = headers.index("article_id") + 1
-        status_col = headers.index("status") + 1
-    except ValueError as exc:
+    if worksheet is None:
         raise ValueError(
-            "Articles sheet is missing article_id or status column."
-        ) from exc
+            f"'{BRIEFINGS_SHEET}' sheet was not found."
+        )
 
-    records = worksheet.get_all_values()
+    existing = worksheet.get_all_values()
 
-    for row_number, row in enumerate(records[1:], start=2):
-        if (
-            len(row) >= article_id_col
-            and row[article_id_col - 1].strip() == article_id
-        ):
-            cell = gspread.utils.rowcol_to_a1(
-                row_number,
-                status_col,
-            )
+    if not existing:
+        worksheet.append_row(
+            BRIEFING_HEADERS,
+            value_input_option="USER_ENTERED",
+        )
+        return
 
-            worksheet.update(
-                range_name=cell,
-                values=[[new_status]],
-            )
+    existing_headers = existing[0]
 
-            return True
+    if existing_headers != BRIEFING_HEADERS:
+        raise ValueError(
+            f"{BRIEFINGS_SHEET} header mismatch.\n"
+            f"Expected:\n{BRIEFING_HEADERS}\n"
+            f"Found:\n{existing_headers}"
+        )
 
-    return False
+
+def write_briefing_row(
+    worksheet,
+    row_number: int | None,
+    row_values: list,
+):
+
+    if row_number:
+        end_col = len(BRIEFING_HEADERS)
+
+        # Convert column number to A1 notation.
+        def col_letter(n):
+            result = ""
+            while n:
+                n, remainder = divmod(
+                    n - 1,
+                    26,
+                )
+                result = chr(
+                    65 + remainder
+                ) + result
+
+            return result
+
+        range_name = (
+            f"A{row_number}:"
+            f"{col_letter(end_col)}{row_number}"
+        )
+
+        worksheet.update(
+            range_name=range_name,
+            values=[row_values],
+        )
+
+    else:
+        worksheet.append_row(
+            row_values,
+            value_input_option="USER_ENTERED",
+        )
 
 
 # ============================================================
-# CONTENT PREPARATION
+# MAIN PROCESS
 # ============================================================
 
-def prepare_content(article, max_content_chars):
-    """
-    Full article is always preferred.
+def process_articles(
+    spreadsheet,
+    client,
+    settings,
+    metrics,
+):
 
-    If the source blocks the fetch (e.g. Becker's 403), use the
-    collector's stored excerpt as a fallback. This avoids paying
-    OpenAI for an article we cannot actually provide useful material for.
-    """
-    print(f"[FETCH] {article['url']}")
-
-    content, fetch_status = fetch_article(article["url"])
-
-    if content:
-        content = content[:max_content_chars]
-
-        print(
-            f"[FETCH] {len(content)} characters extracted "
-            f"(source=full_content)."
-        )
-
-        return content, "full_content"
-
-    excerpt = clean_text(article.get("excerpt", ""))
-
-    if excerpt:
-        excerpt = excerpt[:max_content_chars]
-
-        print(
-            f"[FALLBACK] Article fetch={fetch_status}; "
-            f"using Articles.excerpt ({len(excerpt)} characters)."
-        )
-
-        return excerpt, "excerpt_fallback"
-
-    raise ValueError(
-        f"Article unavailable and no usable excerpt "
-        f"(fetch_status={fetch_status})."
+    articles = get_selected_articles(
+        spreadsheet
     )
 
+    print(
+        f"[BRIEFING] Selected articles: "
+        f"{len(articles)}"
+    )
 
-# ============================================================
-# PROCESS ARTICLES
-# ============================================================
+    if not articles:
+        print(
+            "[BRIEFING] No selected articles."
+        )
+        return
 
-def process_articles(spreadsheet, settings, articles):
-    articles_ws = spreadsheet.worksheet(ARTICLES_SHEET)
-    briefings_ws = spreadsheet.worksheet(BRIEFINGS_SHEET)
+    briefings_sheet = get_worksheet(
+        spreadsheet,
+        BRIEFINGS_SHEET,
+    )
 
-    ensure_briefings_schema(briefings_ws)
+    ensure_briefings_header(
+        briefings_sheet
+    )
 
-    existing_ids = get_existing_briefing_ids(briefings_ws)
+    existing = load_existing_briefings(
+        briefings_sheet
+    )
 
     model = setting(
         settings,
-        "briefing_model",
+        "model",
         DEFAULT_MODEL,
     )
 
     language = setting(
         settings,
-        "briefing_language",
+        "language",
         DEFAULT_LANGUAGE,
     )
 
-    max_content_chars = setting_int(
-        settings,
-        "briefing_max_content_chars",
-        DEFAULT_MAX_CONTENT_CHARS,
-    )
-
-    temperature = setting_float(
-        settings,
-        "briefing_temperature",
-        DEFAULT_TEMPERATURE,
-    )
-
-    # gpt-5.6-luna currently only supports the default temperature=1.
-    # Protect the run from an old/mistyped Settings value.
-    if model == DEFAULT_MODEL and temperature != 1.0:
-        print(
-            "[SETTINGS] gpt-5.6-luna requires temperature=1; "
-            "overriding configured value."
+    max_content_chars = int(
+        safe_float(
+            setting(
+                settings,
+                "max_content_chars",
+                DEFAULT_MAX_CONTENT_CHARS,
+            ),
+            DEFAULT_MAX_CONTENT_CHARS,
         )
-        temperature = 1.0
+    )
 
-    print(f"[SETTINGS] model={model}")
-    print(f"[SETTINGS] max_content_chars={max_content_chars}")
-    print(f"[SETTINGS] language={language}")
-    print(f"[SETTINGS] temperature={temperature}")
-    print("[SETTINGS] prompt=loaded from Settings")
+    reasoning_effort = setting(
+        settings,
+        "reasoning_effort",
+        DEFAULT_REASONING_EFFORT,
+    )
 
-    client = get_openai_client()
+    max_output_tokens = int(
+        safe_float(
+            setting(
+                settings,
+                "max_output_tokens",
+                DEFAULT_MAX_OUTPUT_TOKENS,
+            ),
+            DEFAULT_MAX_OUTPUT_TOKENS,
+        )
+    )
+
+    custom_prompt = setting(
+        settings,
+        "briefing_prompt",
+        setting(
+            settings,
+            "prompt",
+            "",
+        ),
+    )
+
+    system_prompt = build_system_prompt(
+        metrics=metrics,
+        custom_prompt=custom_prompt,
+        language=language,
+    )
+
+    schema = build_metric_schema(
+        metrics
+    )
+
+    print(
+        f"[SETTINGS] model={model}"
+    )
+    print(
+        f"[SETTINGS] max_content_chars="
+        f"{max_content_chars}"
+    )
+    print(
+        f"[SETTINGS] reasoning_effort="
+        f"{reasoning_effort}"
+    )
+    print(
+        f"[SETTINGS] language={language}"
+    )
+    print(
+        f"[SETTINGS] active metrics="
+        f"{len(metrics)}"
+    )
+    print(
+        "[SETTINGS] prompt="
+        + (
+            "loaded from Settings"
+            if custom_prompt
+            else "default"
+        )
+    )
 
     successful = 0
     failed = 0
     skipped = 0
     fallback_count = 0
 
-    for record in articles:
-        article = normalize_article(record)
-        article_id = article["article_id"]
+    for article in articles:
+
+        article_id = clean_text(
+            article.get("article_id")
+        )
+
+        title = clean_text(
+            article.get("title")
+        )
 
         if not article_id:
-            print("[SKIP] Article without article_id.")
-            skipped += 1
-            continue
-
-        if article_id in existing_ids:
             print(
-                f"[SKIP] Already briefed: "
-                f"{article['title']}"
+                "[SKIP] Article without article_id."
             )
-
-            try:
-                update_article_status(
-                    articles_ws,
-                    article_id,
-                    "BRIEFED",
-                )
-            except Exception as exc:
-                print(
-                    f"[WARN] Could not update article status: {exc}"
-                )
-
             skipped += 1
             continue
 
-        print(f"[BRIEFING] {article['title']}")
+        print(
+            f"\n[BRIEFING] {title}"
+        )
+
+        # ----------------------------------------------------
+        # Skip if a successful briefing already exists.
+        # This is one of the most important cost controls.
+        # ----------------------------------------------------
+
+        existing_item = existing.get(
+            article_id
+        )
+
+        if existing_item:
+            row_number, old_row = existing_item
+
+            if is_successful_briefing(
+                old_row
+            ):
+                print(
+                    "[SKIP] Successful briefing "
+                    "already exists."
+                )
+                skipped += 1
+                continue
+
+        # ----------------------------------------------------
+        # Fetch content
+        # ----------------------------------------------------
+
+        url = clean_text(
+            article.get("url")
+        )
+
+        excerpt = clean_text(
+            article.get("excerpt")
+        )
+
+        print(
+            f"[FETCH] {url}"
+        )
+
+        content, content_source = (
+            fetch_article_content(
+                url=url,
+                excerpt=excerpt,
+                max_chars=max_content_chars,
+            )
+        )
+
+        if not content:
+            print(
+                "[ERROR] No article content available."
+            )
+            failed += 1
+            continue
+
+        if content_source == "excerpt_fallback":
+            fallback_count += 1
+
+        print(
+            f"[CONTENT] source={content_source}, "
+            f"chars={len(content)}"
+        )
+
+        # ----------------------------------------------------
+        # One OpenAI request
+        # ----------------------------------------------------
+
+        article_input = build_article_input(
+            title=title,
+            source=clean_text(
+                article.get("source")
+            ),
+            topics=clean_text(
+                article.get(
+                    "matched_topics"
+                )
+                or article.get("topics")
+            ),
+            content=content,
+        )
 
         try:
-            content, content_source = prepare_content(
-                article,
-                max_content_chars,
-            )
-
-            if content_source == "excerpt_fallback":
-                fallback_count += 1
-
-            system_prompt, user_prompt = build_prompt(
-                settings=settings,
-                article=article,
-                content=content,
-                content_source=content_source,
-                language=language,
-            )
 
             result = call_openai(
                 client=client,
                 model=model,
+                reasoning_effort=reasoning_effort,
                 system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                temperature=temperature,
+                article_input=article_input,
+                schema=schema,
+                max_output_tokens=max_output_tokens,
             )
 
-            row = create_briefing_row(
-                article,
-                result,
-                model,
+            row_values = build_briefing_row(
+                article=article,
+                result=result,
+                metrics=metrics,
+                model=model,
             )
 
-            briefings_ws.append_row(
-                row,
-                value_input_option="USER_ENTERED",
+            row_number = (
+                existing_item[0]
+                if existing_item
+                else None
             )
 
-            # Mark only after successful persistence.
-            update_article_status(
-                articles_ws,
-                article_id,
-                "BRIEFED",
+            write_briefing_row(
+                worksheet=briefings_sheet,
+                row_number=row_number,
+                row_values=row_values,
             )
 
-            existing_ids.add(article_id)
             successful += 1
 
-            print(
-                f"[SUCCESS] {article['title']} "
-                f"(content={content_source})"
+            score_index = (
+                BRIEFING_HEADERS.index(
+                    "reading_score"
+                )
             )
+
+            reading_score = row_values[
+                score_index
+            ]
+
+            print(
+                f"[SUCCESS] {title} "
+                f"(reading_score={reading_score}, "
+                f"content={content_source})"
+            )
+
+            # Avoid hammering Sheets/API too quickly.
+            time.sleep(0.15)
 
         except Exception as exc:
-            failed += 1
 
             print(
-                f"[ERROR] {article['title']}: {exc}"
+                f"[ERROR] {title}: "
+                f"{type(exc).__name__}: {exc}"
             )
 
-            # Keep SELECTED so it can be retried later.
-            continue
+            failed += 1
 
-    return successful, failed, skipped, fallback_count
+    print(
+        "\n"
+        + "=" * 60
+    )
+    print("BRIEFING SUMMARY")
+    print("=" * 60)
+
+    print(
+        f"Selected: {len(articles)}"
+    )
+    print(
+        f"Successful: {successful}"
+    )
+    print(
+        f"Failed: {failed}"
+    )
+    print(
+        f"Skipped: {skipped}"
+    )
+    print(
+        f"Excerpt fallback: {fallback_count}"
+    )
+
+    print("=" * 60)
 
 
 # ============================================================
@@ -895,38 +1385,42 @@ def process_articles(spreadsheet, settings, articles):
 # ============================================================
 
 def main():
+
     print("=" * 60)
-    print(f"AI BRIEFING ENGINE v{VERSION}")
+    print(
+        f"AI BRIEFING ENGINE v{VERSION}"
+    )
     print("=" * 60)
 
     spreadsheet = get_spreadsheet()
-    settings = load_settings(spreadsheet)
 
-    articles = load_selected_articles(spreadsheet)
+    settings = load_settings(
+        spreadsheet
+    )
+
+    metrics = load_reading_metrics(
+        spreadsheet
+    )
 
     print(
-        f"[BRIEFING] Selected articles: {len(articles)}"
+        "[METRICS] Active Reading Metrics:"
     )
 
-    if not articles:
-        print("[BRIEFING] No selected articles.")
-        return
+    for metric in metrics:
+        print(
+            f"  - {metric['metric_id']}: "
+            f"{metric['metric_name']} "
+            f"(weight={metric['weight']})"
+        )
 
-    successful, failed, skipped, fallback_count = process_articles(
+    client = get_openai_client()
+
+    process_articles(
         spreadsheet=spreadsheet,
+        client=client,
         settings=settings,
-        articles=articles,
+        metrics=metrics,
     )
-
-    print("\n" + "=" * 60)
-    print("BRIEFING SUMMARY")
-    print("=" * 60)
-    print(f"Selected: {len(articles)}")
-    print(f"Successful: {successful}")
-    print(f"Failed: {failed}")
-    print(f"Skipped: {skipped}")
-    print(f"Excerpt fallback: {fallback_count}")
-    print("=" * 60)
 
 
 if __name__ == "__main__":
