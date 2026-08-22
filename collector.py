@@ -9,8 +9,7 @@ import requests
 from bs4 import BeautifulSoup
 from google.oauth2.service_account import Credentials
 
-from parsers import himss
-from parsers import ahrq_psnet
+import importlib
 
 
 SCOPES = [
@@ -771,16 +770,126 @@ def collect_api(source):
 
 
 # ============================================================
-# SOURCE DISPATCHER
+# DYNAMIC PARSER LOADER
 # ============================================================
 
+def load_parser(parser_name):
+    """
+    Dynamically load a custom parser from parsers/<parser_name>.py.
+
+    Sources with an empty parser field use the generic collector
+    determined by access_method.
+
+    Custom parser modules must expose:
+        collect(source)
+    """
+
+    parser_name = clean_text(
+        parser_name
+    )
+
+    if not parser_name:
+        return None
+
+    # Only allow simple Python module names. This prevents a Sheet
+    # value from being interpreted as an arbitrary import path.
+    if not parser_name.replace(
+        "_",
+        "",
+    ).isalnum():
+        raise ValueError(
+            f"Invalid parser name: "
+            f"{parser_name}"
+        )
+
+    module_name = (
+        f"parsers.{parser_name}"
+    )
+
+    try:
+        parser = importlib.import_module(
+            module_name
+        )
+
+    except ModuleNotFoundError as error:
+        # Make the failure explicit and useful.
+        if (
+            error.name == module_name
+            or error.name == parser_name
+        ):
+            raise RuntimeError(
+                f"Parser '{parser_name}' "
+                f"was not found. Expected file: "
+                f"parsers/{parser_name}.py"
+            ) from error
+
+        raise
+
+    collect_function = getattr(
+        parser,
+        "collect",
+        None,
+    )
+
+    if not callable(
+        collect_function
+    ):
+        raise RuntimeError(
+            f"Parser '{parser_name}' "
+            f"does not expose a callable "
+            f"collect(source) function."
+        )
+
+    return parser
+
+
 def collect_source(source):
+    """
+    Collect a source using a custom parser when configured.
+
+    Sources:
+        parser = <module name>
+            -> parsers/<module name>.py
+
+        parser = empty
+            -> generic RSS/WEB/API collector
+    """
+
     name = clean_text(
         source.get(
             "name",
+            "Unknown",
+        )
+    )
+
+    parser_name = clean_text(
+        source.get(
+            "parser",
             "",
         )
     )
+
+    # Custom parser takes precedence over access_method.
+    if parser_name:
+        print(
+            f"[PARSER] {name}: "
+            f"loading parsers.{parser_name}"
+        )
+
+        parser = load_parser(
+            parser_name
+        )
+
+        articles = parser.collect(
+            source
+        )
+
+        print(
+            f"[PARSER] {name}: "
+            f"{len(articles)} articles returned."
+        )
+
+        return articles
 
     access_method = (
         clean_text(
@@ -791,16 +900,6 @@ def collect_source(source):
         )
         .upper()
     )
-
-    if name.lower() == "ahrq psnet":
-        return ahrq_psnet.collect(
-            source
-        )
-
-    if name.lower() == "himss":
-        return himss.collect(
-            source
-        )
 
     if access_method == "RSS":
         return collect_rss(
@@ -818,8 +917,9 @@ def collect_source(source):
         )
 
     raise ValueError(
-        f"Unsupported access method: "
-        f"{access_method}"
+        f"Unsupported access method "
+        f"'{access_method}' for source "
+        f"'{name}'."
     )
 
 
@@ -1045,6 +1145,40 @@ def main():
             f"Active sources: "
             f"{len(sources)}"
         )
+
+        for source in sources:
+            source_name = clean_text(
+                source.get(
+                    "name",
+                    "Unknown",
+                )
+            )
+
+            parser_name = clean_text(
+                source.get(
+                    "parser",
+                    "",
+                )
+            )
+
+            access_method = clean_text(
+                source.get(
+                    "access_method",
+                    "",
+                )
+            ).upper()
+
+            if parser_name:
+                print(
+                    f"[SOURCE] {source_name}: "
+                    f"custom parser = "
+                    f"parsers.{parser_name}"
+                )
+            else:
+                print(
+                    f"[SOURCE] {source_name}: "
+                    f"generic {access_method} collector"
+                )
 
         all_articles = []
         source_results = []
