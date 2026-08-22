@@ -465,8 +465,8 @@ def update_article_status(
         )
 
         worksheet.update(
-            cell,
-            [[new_status]],
+            range_name=cell,
+            values=[[new_status]],
         )
 
         return
