@@ -146,6 +146,14 @@ def is_article_url(url):
         "/privacy",
         "/terms",
         "/y-te.html",
+        "/khoa-giao/",
+        "/chu-de/",
+        "/chu-de",
+        "/danh-muc/",
+        "/category/",
+        "/topic/",
+        "/topics/",
+        "/page/",
         "#",
     )
 
@@ -587,6 +595,9 @@ def collect(source):
         title = extract_title(
             anchor
         )
+
+        if not title:
+            continue
 
         if len(title) < 20:
             continue
