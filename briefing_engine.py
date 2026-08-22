@@ -12,10 +12,10 @@ from openai import OpenAI
 
 
 # ============================================================
-# CONFIG
+# AI BRIEFING ENGINE
 # ============================================================
 
-VERSION = "0.3"
+VERSION = "0.4"
 
 ARTICLES_SHEET = "Articles"
 BRIEFINGS_SHEET = "Briefings"
@@ -53,6 +53,7 @@ def get_spreadsheet():
     )
 
     client = gspread.authorize(credentials)
+
     spreadsheet = client.open_by_key(spreadsheet_id)
 
     print(f"Connected to: {spreadsheet.title}")
@@ -62,22 +63,6 @@ def get_spreadsheet():
 
 def get_worksheet(spreadsheet, name):
     return spreadsheet.worksheet(name)
-
-
-def get_records(worksheet):
-    records = worksheet.get_all_records()
-
-    return records
-
-
-def build_header_mapping(worksheet):
-    headers = worksheet.row_values(1)
-
-    return {
-        header.strip(): index
-        for index, header in enumerate(headers)
-        if header.strip()
-    }
 
 
 def row_value(row, key, default=""):
@@ -94,18 +79,24 @@ def row_value(row, key, default=""):
 # ============================================================
 
 def load_settings(spreadsheet):
-    worksheet = get_worksheet(spreadsheet, SETTINGS_SHEET)
+    worksheet = get_worksheet(
+        spreadsheet,
+        SETTINGS_SHEET,
+    )
 
     records = worksheet.get_all_records()
 
     settings = {}
 
     for record in records:
-        key = str(record.get("key", "")).strip()
-        value = record.get("value", "")
+        key = str(
+            record.get("key", "")
+        ).strip()
 
         if not key:
             continue
+
+        value = record.get("value", "")
 
         settings[key] = value
 
@@ -128,7 +119,11 @@ def setting(settings, key, default=None):
 
 
 def setting_int(settings, key, default):
-    value = setting(settings, key, default)
+    value = setting(
+        settings,
+        key,
+        default,
+    )
 
     try:
         return int(value)
@@ -137,7 +132,7 @@ def setting_int(settings, key, default):
 
 
 # ============================================================
-# TEXT / HTML
+# TEXT CLEANING
 # ============================================================
 
 def clean_text(text):
@@ -146,7 +141,11 @@ def clean_text(text):
 
     text = html.unescape(text)
 
-    text = re.sub(r"\s+", " ", text)
+    text = re.sub(
+        r"\s+",
+        " ",
+        text,
+    )
 
     return text.strip()
 
@@ -155,7 +154,10 @@ def html_to_text(content):
     try:
         from bs4 import BeautifulSoup
 
-        soup = BeautifulSoup(content, "html.parser")
+        soup = BeautifulSoup(
+            content,
+            "html.parser",
+        )
 
         for tag in soup([
             "script",
@@ -169,11 +171,9 @@ def html_to_text(content):
         ]):
             tag.decompose()
 
-        text = soup.get_text("\n")
-
         lines = []
 
-        for line in text.splitlines():
+        for line in soup.get_text("\n").splitlines():
             line = clean_text(line)
 
             if line:
@@ -182,20 +182,26 @@ def html_to_text(content):
         return "\n".join(lines)
 
     except Exception:
-        content = re.sub(r"<[^>]+>", " ", content)
+        content = re.sub(
+            r"<[^>]+>",
+            " ",
+            content,
+        )
+
         return clean_text(content)
 
 
 # ============================================================
-# ARTICLE FETCHING
+# FETCH ARTICLE
 # ============================================================
 
 def fetch_article(url):
     headers = {
         "User-Agent": USER_AGENT,
         "Accept": (
-            "text/html,application/xhtml+xml,application/xml;"
-            "q=0.9,image/avif,image/webp,*/*;q=0.8"
+            "text/html,application/xhtml+xml,"
+            "application/xml;q=0.9,"
+            "image/avif,image/webp,*/*;q=0.8"
         ),
         "Accept-Language": "en-US,en;q=0.9",
     }
@@ -208,9 +214,9 @@ def fetch_article(url):
 
     response.raise_for_status()
 
-    text = html_to_text(response.text)
-
-    return text
+    return html_to_text(
+        response.text
+    )
 
 
 # ============================================================
@@ -218,19 +224,25 @@ def fetch_article(url):
 # ============================================================
 
 def get_openai_client():
-    api_key = os.environ.get("OPENAI_API_KEY")
+    api_key = os.environ.get(
+        "OPENAI_API_KEY"
+    )
 
     if not api_key:
         raise RuntimeError(
             "Missing OPENAI_API_KEY environment variable."
         )
 
-    return OpenAI(api_key=api_key)
+    return OpenAI(
+        api_key=api_key
+    )
 
 
 def extract_json(text):
     if not text:
-        raise ValueError("OpenAI returned empty response.")
+        raise ValueError(
+            "OpenAI returned empty response."
+        )
 
     text = text.strip()
 
@@ -251,24 +263,31 @@ def extract_json(text):
 
     text = text.strip()
 
+    # First attempt
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
 
-    # Try extracting the first JSON object
+    # Attempt to extract JSON object
     start = text.find("{")
     end = text.rfind("}")
 
     if start >= 0 and end > start:
-        candidate = text[start:end + 1]
+        candidate = text[
+            start:end + 1
+        ]
 
         try:
-            return json.loads(candidate)
+            return json.loads(
+                candidate
+            )
         except json.JSONDecodeError:
             pass
 
-    raise ValueError("OpenAI returned invalid JSON.")
+    raise ValueError(
+        "OpenAI returned invalid JSON."
+    )
 
 
 def call_openai(
@@ -279,7 +298,9 @@ def call_openai(
 ):
     last_error = None
 
-    for attempt in range(OPENAI_RETRY_COUNT + 1):
+    for attempt in range(
+        OPENAI_RETRY_COUNT + 1
+    ):
         try:
             response = client.chat.completions.create(
                 model=model,
@@ -299,32 +320,45 @@ def call_openai(
                 ],
             )
 
-            content = response.choices[0].message.content
+            content = (
+                response
+                .choices[0]
+                .message
+                .content
+            )
 
-            return extract_json(content)
+            return extract_json(
+                content
+            )
 
         except Exception as exc:
             last_error = exc
 
             if attempt < OPENAI_RETRY_COUNT:
-                time.sleep(OPENAI_RETRY_DELAY)
+                time.sleep(
+                    OPENAI_RETRY_DELAY
+                )
             else:
                 raise last_error
 
 
 # ============================================================
-# PROMPT
+# DEFAULT PROMPT
 # ============================================================
 
 DEFAULT_SYSTEM_PROMPT = """
-You are a senior healthcare management and healthcare technology analyst.
+You are a senior healthcare management and
+healthcare technology analyst.
 
 Analyze the supplied healthcare article carefully.
 
 Return ONLY valid JSON.
 
-The analysis must be factual and grounded in the supplied article.
-Do not invent facts, numbers, quotes, organizations, outcomes, or implications.
+The analysis must be factual and grounded in
+the supplied article.
+
+Do not invent facts, numbers, quotes,
+organizations, outcomes, or implications.
 
 Write the output in Vietnamese.
 
@@ -345,12 +379,14 @@ Required JSON structure:
   ]
 }
 
-Keep the analysis practical and relevant to healthcare
-management, hospital operations, strategy, digital health,
-patient experience, workforce, finance, and clinical operations
+Keep the analysis practical and relevant to
+healthcare management, hospital operations,
+strategy, digital health, patient experience,
+workforce, finance, and clinical operations
 when applicable.
 
-Do not force relevance if the article does not support it.
+Do not force relevance if the article does
+not support it.
 """
 
 
@@ -371,19 +407,22 @@ def build_prompt(
         "",
     )
 
-    topics = article["topics"]
+    variables = {
+        "source": article["source"],
+        "title": article["title"],
+        "url": article["url"],
+        "published_at": article["published_at"],
+        "rule_score": article["rule_score"],
+        "topics": article["topics"],
+        "content": content,
+    }
 
     if user_template:
         try:
             user_prompt = user_template.format(
-                source=article["source"],
-                title=article["title"],
-                url=article["url"],
-                published_at=article["published_at"],
-                rule_score=article["rule_score"],
-                topics=topics,
-                content=content,
+                **variables
             )
+
         except Exception:
             user_prompt = (
                 f"Source: {article['source']}\n"
@@ -391,9 +430,10 @@ def build_prompt(
                 f"URL: {article['url']}\n"
                 f"Published at: {article['published_at']}\n"
                 f"Rule score: {article['rule_score']}\n"
-                f"Topics: {topics}\n\n"
+                f"Topics: {article['topics']}\n\n"
                 f"ARTICLE CONTENT:\n{content}"
             )
+
     else:
         user_prompt = (
             f"Source: {article['source']}\n"
@@ -401,7 +441,7 @@ def build_prompt(
             f"URL: {article['url']}\n"
             f"Published at: {article['published_at']}\n"
             f"Rule score: {article['rule_score']}\n"
-            f"Topics: {topics}\n\n"
+            f"Topics: {article['topics']}\n\n"
             f"ARTICLE CONTENT:\n{content}"
         )
 
@@ -409,8 +449,25 @@ def build_prompt(
 
 
 # ============================================================
-# BRIEFINGS SCHEMA
+# SHEET SCHEMA
 # ============================================================
+
+ARTICLES_HEADERS = [
+    "article_id",
+    "source",
+    "title",
+    "url",
+    "published_at",
+    "excerpt",
+    "matched_topics",
+    "matched_related_terms",
+    "matched_context_terms",
+    "rule_score",
+    "matched_keywords",
+    "status",
+    "discovered_at",
+]
+
 
 BRIEFINGS_HEADERS = [
     "article_id",
@@ -430,20 +487,42 @@ BRIEFINGS_HEADERS = [
 ]
 
 
-def ensure_briefings_headers(worksheet):
-    current_headers = worksheet.row_values(1)
+def validate_articles_schema(
+    worksheet
+):
+    headers = worksheet.row_values(1)
 
-    if not current_headers:
+    missing = [
+        header
+        for header in ARTICLES_HEADERS
+        if header not in headers
+    ]
+
+    if missing:
+        raise ValueError(
+            "Articles sheet is missing columns: "
+            + ", ".join(missing)
+        )
+
+
+def ensure_briefings_schema(
+    worksheet
+):
+    headers = worksheet.row_values(1)
+
+    if not headers:
         worksheet.update(
             range_name="A1",
-            values=[BRIEFINGS_HEADERS],
+            values=[
+                BRIEFINGS_HEADERS
+            ],
         )
         return
 
     missing = [
         header
         for header in BRIEFINGS_HEADERS
-        if header not in current_headers
+        if header not in headers
     ]
 
     if missing:
@@ -454,89 +533,43 @@ def ensure_briefings_headers(worksheet):
 
 
 # ============================================================
-# EXISTING BRIEFINGS
+# ARTICLE LOADING
 # ============================================================
 
-def get_existing_briefing_ids(worksheet):
-    records = worksheet.get_all_records()
+def load_selected_articles(
+    spreadsheet
+):
+    """
+    Selection is represented directly
+    in Articles.status.
 
-    ids = set()
+    No Selection sheet is required.
+    """
 
-    for record in records:
-        article_id = str(
-            record.get("article_id", "")
-        ).strip()
+    worksheet = spreadsheet.worksheet(
+        ARTICLES_SHEET
+    )
 
-        if article_id:
-            ids.add(article_id)
-
-    return ids
-
-
-# ============================================================
-# ARTICLE SELECTION INPUT
-# ============================================================
-
-def get_selected_articles(spreadsheet):
-    try:
-        worksheet = spreadsheet.worksheet("Selection")
-    except gspread.WorksheetNotFound:
-        raise ValueError(
-            "Selection sheet was not found."
-        )
+    validate_articles_schema(
+        worksheet
+    )
 
     records = worksheet.get_all_records()
 
     selected = []
 
     for record in records:
-        status = str(
-            record.get("status", "")
-        ).strip().upper()
-
-        if status != "SELECTED":
-            continue
-
-        selected.append(record)
-
-    return selected
-
-
-def get_selected_articles_fallback(spreadsheet):
-    """
-    Supports the current workflow where selection_engine
-    may write selected articles back to Articles using
-    status=SELECTED.
-    """
-
-    worksheet = spreadsheet.worksheet(ARTICLES_SHEET)
-
-    records = worksheet.get_all_records()
-
-    selected = []
-
-    for record in records:
-        status = str(
-            record.get("status", "")
-        ).strip().upper()
+        status = row_value(
+            record,
+            "status",
+        ).upper()
 
         if status == "SELECTED":
-            selected.append(record)
+            selected.append(
+                record
+            )
 
     return selected
-
-
-def load_selected_articles(spreadsheet):
-    try:
-        selected = get_selected_articles(spreadsheet)
-
-        if selected:
-            return selected
-
-    except gspread.WorksheetNotFound:
-        pass
-
-    return get_selected_articles_fallback(spreadsheet)
 
 
 # ============================================================
@@ -545,65 +578,96 @@ def load_selected_articles(spreadsheet):
 
 def normalize_article(record):
     """
-    IMPORTANT:
-    Google Sheets column is matched_topics.
-    Internal briefing field is topics.
-    """
+    Google Sheets:
+        matched_topics
 
-    matched_topics = row_value(
-        record,
-        "matched_topics",
-    )
+    Internal field:
+        topics
+    """
 
     return {
         "article_id": row_value(
             record,
             "article_id",
         ),
+
         "source": row_value(
             record,
             "source",
         ),
+
         "title": row_value(
             record,
             "title",
         ),
+
         "url": row_value(
             record,
             "url",
         ),
+
         "published_at": row_value(
             record,
             "published_at",
         ),
+
         "rule_score": row_value(
             record,
             "rule_score",
         ),
-        "topics": matched_topics,
-        "status": row_value(
+
+        "topics": row_value(
             record,
-            "status",
+            "matched_topics",
         ),
     }
 
 
 # ============================================================
-# OUTPUT FORMATTING
+# EXISTING BRIEFINGS
+# ============================================================
+
+def get_existing_briefing_ids(
+    worksheet
+):
+    records = worksheet.get_all_records()
+
+    ids = set()
+
+    for record in records:
+        article_id = row_value(
+            record,
+            "article_id",
+        )
+
+        if article_id:
+            ids.add(article_id)
+
+    return ids
+
+
+# ============================================================
+# OUTPUT HELPERS
 # ============================================================
 
 def normalize_list(value):
     if value is None:
         return []
 
-    if isinstance(value, list):
+    if isinstance(
+        value,
+        list,
+    ):
         return [
             str(item).strip()
             for item in value
             if str(item).strip()
         ]
 
-    if isinstance(value, str):
+    if isinstance(
+        value,
+        str,
+    ):
         value = value.strip()
 
         if not value:
@@ -611,11 +675,17 @@ def normalize_list(value):
 
         return [value]
 
-    return [str(value).strip()]
+    return [
+        str(value).strip()
+    ]
 
 
-def list_to_sheet_value(value):
-    items = normalize_list(value)
+def list_to_sheet_value(
+    value
+):
+    items = normalize_list(
+        value
+    )
 
     return "\n".join(
         f"• {item}"
@@ -623,8 +693,15 @@ def list_to_sheet_value(value):
     )
 
 
-def safe_json_value(data, key, default=""):
-    value = data.get(key, default)
+def safe_result_value(
+    result,
+    key,
+    default="",
+):
+    value = result.get(
+        key,
+        default,
+    )
 
     if value is None:
         return default
@@ -649,65 +726,102 @@ def create_briefing_row(
         article["published_at"],
         article["rule_score"],
         article["topics"],
+
         str(
-            safe_json_value(
+            safe_result_value(
                 result,
                 "summary",
                 "",
             )
         ).strip(),
+
         list_to_sheet_value(
-            safe_json_value(
+            safe_result_value(
                 result,
                 "key_points",
                 [],
             )
         ),
+
         str(
-            safe_json_value(
+            safe_result_value(
                 result,
                 "why_it_matters",
                 "",
             )
         ).strip(),
+
         list_to_sheet_value(
-            safe_json_value(
+            safe_result_value(
                 result,
                 "implications",
                 [],
             )
         ),
+
         model,
         created_at,
         "COMPLETED",
     ]
 
 
-def create_failed_row(
-    article,
-    model,
-    error,
-):
-    created_at = datetime.now(
-        timezone.utc
-    ).isoformat()
+# ============================================================
+# ARTICLE STATUS UPDATE
+# ============================================================
 
-    return [
-        article["article_id"],
-        article["source"],
-        article["title"],
-        article["url"],
-        article["published_at"],
-        article["rule_score"],
-        article["topics"],
-        "",
-        "",
-        "",
-        "",
-        model,
-        created_at,
-        f"FAILED: {str(error)[:500]}",
-    ]
+def update_article_status(
+    worksheet,
+    article_id,
+    new_status,
+):
+    headers = worksheet.row_values(1)
+
+    try:
+        article_id_col = (
+            headers.index("article_id")
+            + 1
+        )
+
+        status_col = (
+            headers.index("status")
+            + 1
+        )
+
+    except ValueError as exc:
+        raise ValueError(
+            "Articles sheet is missing "
+            "article_id or status column."
+        ) from exc
+
+    records = worksheet.get_all_values()
+
+    for row_number, row in enumerate(
+        records[1:],
+        start=2,
+    ):
+        if (
+            len(row)
+            >= article_id_col
+            and row[
+                article_id_col - 1
+            ].strip()
+            == article_id
+        ):
+            cell = gspread.utils.rowcol_to_a1(
+                row_number,
+                status_col,
+            )
+
+            worksheet.update(
+                range_name=cell,
+                values=[
+                    [new_status]
+                ],
+            )
+
+            return True
+
+    return False
 
 
 # ============================================================
@@ -719,11 +833,15 @@ def process_articles(
     settings,
     articles,
 ):
+    articles_ws = spreadsheet.worksheet(
+        ARTICLES_SHEET
+    )
+
     briefings_ws = spreadsheet.worksheet(
         BRIEFINGS_SHEET
     )
 
-    ensure_briefings_headers(
+    ensure_briefings_schema(
         briefings_ws
     )
 
@@ -754,8 +872,8 @@ def process_articles(
     )
 
     print(
-        f"[SETTINGS] max_content_chars="
-        f"{max_content_chars}"
+        f"[SETTINGS] "
+        f"max_content_chars={max_content_chars}"
     )
 
     print(
@@ -763,7 +881,8 @@ def process_articles(
     )
 
     print(
-        "[SETTINGS] prompt=loaded from Settings"
+        "[SETTINGS] "
+        "prompt=loaded from Settings"
     )
 
     client = get_openai_client()
@@ -773,14 +892,20 @@ def process_articles(
     skipped = 0
 
     for record in articles:
-        article = normalize_article(record)
 
-        article_id = article["article_id"]
+        article = normalize_article(
+            record
+        )
+
+        article_id = article[
+            "article_id"
+        ]
 
         if not article_id:
             print(
                 "[SKIP] Article without article_id."
             )
+
             skipped += 1
             continue
 
@@ -789,16 +914,33 @@ def process_articles(
                 f"[SKIP] Already briefed: "
                 f"{article['title']}"
             )
+
+            # Keep state consistent
+            try:
+                update_article_status(
+                    articles_ws,
+                    article_id,
+                    "BRIEFED",
+                )
+            except Exception as exc:
+                print(
+                    f"[WARN] Could not update "
+                    f"article status: {exc}"
+                )
+
             skipped += 1
             continue
 
         print(
-            f"[BRIEFING] {article['title']}"
+            f"[BRIEFING] "
+            f"{article['title']}"
         )
 
         try:
+
             print(
-                f"[FETCH] {article['url']}"
+                f"[FETCH] "
+                f"{article['url']}"
             )
 
             content = fetch_article(
@@ -807,7 +949,8 @@ def process_articles(
 
             print(
                 f"[FETCH] "
-                f"{len(content)} characters extracted."
+                f"{len(content)} "
+                f"characters extracted."
             )
 
             if not content:
@@ -819,10 +962,12 @@ def process_articles(
                 :max_content_chars
             ]
 
-            system_prompt, user_prompt = build_prompt(
-                settings,
-                article,
-                content,
+            system_prompt, user_prompt = (
+                build_prompt(
+                    settings,
+                    article,
+                    content,
+                )
             )
 
             result = call_openai(
@@ -843,27 +988,46 @@ def process_articles(
                 value_input_option="USER_ENTERED",
             )
 
+            # IMPORTANT:
+            # Only mark BRIEFED after the briefing
+            # has successfully been written.
+            update_article_status(
+                articles_ws,
+                article_id,
+                "BRIEFED",
+            )
+
+            existing_ids.add(
+                article_id
+            )
+
             successful += 1
 
             print(
-                f"[SUCCESS] {article['title']}"
+                f"[SUCCESS] "
+                f"{article['title']}"
             )
 
         except Exception as exc:
+
             failed += 1
 
             print(
                 f"[ERROR] "
-                f"{article['title']}: {exc}"
+                f"{article['title']}: "
+                f"{exc}"
             )
 
-            # Do NOT write failed articles to Briefings
-            # by default. This keeps the sheet clean and
-            # allows the article to be retried later.
+            # Keep SELECTED so the article
+            # can be retried later.
 
             continue
 
-    return successful, failed, skipped
+    return (
+        successful,
+        failed,
+        skipped,
+    )
 
 
 # ============================================================
@@ -871,6 +1035,7 @@ def process_articles(
 # ============================================================
 
 def main():
+
     print(
         "=" * 60
     )
@@ -894,20 +1059,26 @@ def main():
     )
 
     print(
-        f"[BRIEFING] Selected articles: "
+        f"[BRIEFING] "
+        f"Selected articles: "
         f"{len(articles)}"
     )
 
     if not articles:
+
         print(
-            "[BRIEFING] No selected articles."
+            "[BRIEFING] "
+            "No selected articles."
         )
+
         return
 
-    successful, failed, skipped = process_articles(
-        spreadsheet=spreadsheet,
-        settings=settings,
-        articles=articles,
+    successful, failed, skipped = (
+        process_articles(
+            spreadsheet=spreadsheet,
+            settings=settings,
+            articles=articles,
+        )
     )
 
     print(
