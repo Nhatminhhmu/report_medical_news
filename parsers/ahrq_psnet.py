@@ -312,6 +312,9 @@ def collect(source):
             "href",
             "",
         )
+        
+        if href.startswith("#"):
+            continue
 
         url = urljoin(
             BASE_URL,
