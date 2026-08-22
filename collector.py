@@ -455,8 +455,8 @@ def complete_run(
             continue
 
         worksheet.update(
-            f"C{index}:E{index}",
-            [
+            range_name=f"C{index}:E{index}",
+            values=[
                 [
                     utc_now(),
                     status,
