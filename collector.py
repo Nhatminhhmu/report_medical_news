@@ -20,6 +20,7 @@ SCOPES = [
 ]
 
 SOURCES_SHEET = "Sources"
+SETTINGS_SHEET = "Settings"
 ARTICLES_SHEET = "Articles"
 
 REQUEST_TIMEOUT = 30
@@ -58,22 +59,14 @@ def get_google_client():
         credentials
     )
 
-    spreadsheet = client.open_by_key(
+    return client.open_by_key(
         spreadsheet_id
     )
-
-    return spreadsheet
 
 
 # ============================================================
 # HELPERS
 # ============================================================
-
-def utc_now():
-    return datetime.now(
-        timezone.utc
-    ).isoformat()
-
 
 def clean_text(value):
     if value is None:
@@ -82,6 +75,12 @@ def clean_text(value):
     return " ".join(
         str(value).split()
     ).strip()
+
+
+def utc_now():
+    return datetime.now(
+        timezone.utc
+    ).isoformat()
 
 
 def make_article_id(url):
@@ -100,7 +99,7 @@ def normalize_url(
         return ""
 
     if base_url:
-        url = urljoin(
+        return urljoin(
             base_url,
             url,
         )
@@ -109,7 +108,125 @@ def normalize_url(
 
 
 # ============================================================
-# READ SOURCES
+# SETTINGS
+# ============================================================
+
+def get_setting(
+    spreadsheet,
+    key,
+    default=None,
+):
+    worksheet = spreadsheet.worksheet(
+        SETTINGS_SHEET
+    )
+
+    records = worksheet.get_all_records()
+
+    for row in records:
+        row_key = clean_text(
+            row.get(
+                "key",
+                "",
+            )
+        )
+
+        if row_key == key:
+            value = clean_text(
+                row.get(
+                    "value",
+                    "",
+                )
+            )
+
+            return value
+
+    return default
+
+
+def get_lookback_days(
+    spreadsheet,
+):
+    value = get_setting(
+        spreadsheet,
+        "lookback_days",
+        7,
+    )
+
+    try:
+        days = int(value)
+
+        if days < 0:
+            raise ValueError
+
+        return days
+
+    except (TypeError, ValueError):
+        print(
+            "Invalid lookback_days. "
+            "Using default: 7"
+        )
+
+        return 7
+
+
+# ============================================================
+# FRESHNESS
+# ============================================================
+
+def parse_published_date(
+    published_at,
+):
+    if not published_at:
+        return None
+
+    try:
+        parsed = feedparser._parse_date(
+            published_at
+        )
+
+        if not parsed:
+            return None
+
+        return datetime(
+            parsed.tm_year,
+            parsed.tm_mon,
+            parsed.tm_mday,
+            parsed.tm_hour,
+            parsed.tm_min,
+            parsed.tm_sec,
+            tzinfo=timezone.utc,
+        )
+
+    except Exception:
+        return None
+
+
+def is_recent_article(
+    published_at,
+    lookback_days,
+):
+    if not published_at:
+        return True
+
+    published = parse_published_date(
+        published_at
+    )
+
+    if published is None:
+        return True
+
+    cutoff = (
+        datetime.now(timezone.utc)
+        - timedelta(
+            days=lookback_days
+        )
+    )
+
+    return published >= cutoff
+
+
+# ============================================================
+# SOURCES
 # ============================================================
 
 def get_active_sources(
@@ -174,72 +291,12 @@ def get_active_sources(
             )
             continue
 
-        sources.append(row)
+        sources.append(
+            row
+        )
 
     return sources
 
-def get_setting(
-    spreadsheet,
-    key,
-    default=None,
-):
-    worksheet = spreadsheet.worksheet(
-        "Settings"
-    )
-
-    records = worksheet.get_all_records()
-
-    for row in records:
-        row_key = clean_text(
-            row.get("key", "")
-        )
-
-        if row_key == key:
-            return clean_text(
-                row.get("value", "")
-            )
-
-    return default
-
-
-def is_recent_article(
-    published_at,
-    lookback_days,
-):
-    if not published_at:
-        return True
-
-    try:
-        parsed = feedparser._parse_date(
-            published_at
-        )
-
-        if not parsed:
-            return True
-
-        published = datetime(
-            parsed.tm_year,
-            parsed.tm_mon,
-            parsed.tm_mday,
-            parsed.tm_hour,
-            parsed.tm_min,
-            parsed.tm_sec,
-            tzinfo=timezone.utc,
-        )
-
-        cutoff = (
-            datetime.now(timezone.utc)
-            - timedelta(
-                days=lookback_days
-            )
-        )
-
-        return published >= cutoff
-
-    except Exception:
-        # Nếu không parse được ngày,
-        # tạm thời giữ bài để tránh mất dữ liệu.
-        return True
 
 # ============================================================
 # RSS COLLECTOR
@@ -516,18 +573,10 @@ def collect_source(source):
         .upper()
     )
 
-    # --------------------------------------------------------
-    # HIMSS-specific parser
-    # --------------------------------------------------------
-
     if name.lower() == "himss":
         return himss.collect(
             source
         )
-
-    # --------------------------------------------------------
-    # Generic collectors
-    # --------------------------------------------------------
 
     if access_method == "RSS":
         return collect_rss(
@@ -554,7 +603,9 @@ def collect_source(source):
 # NORMALIZE ARTICLES
 # ============================================================
 
-def normalize_articles(articles):
+def normalize_articles(
+    articles,
+):
     normalized = []
 
     for article in articles:
@@ -615,7 +666,7 @@ def normalize_articles(articles):
 
 
 # ============================================================
-# EXISTING ARTICLE IDS
+# SAVE ARTICLES
 # ============================================================
 
 def get_existing_article_ids(
@@ -641,10 +692,6 @@ def get_existing_article_ids(
         )
     }
 
-
-# ============================================================
-# SAVE ARTICLES
-# ============================================================
 
 def save_articles(
     spreadsheet,
@@ -682,7 +729,6 @@ def save_articles(
         print(
             "No new articles to save."
         )
-
         return 0
 
     rows = []
@@ -708,9 +754,9 @@ def save_articles(
                 article[
                     "excerpt"
                 ],
-                article[
-                    "topic"
-                ],
+                "",
+                "",
+                "",
                 article[
                     "status"
                 ],
@@ -744,30 +790,25 @@ def main():
         f"{spreadsheet.title}"
     )
 
+    lookback_days = get_lookback_days(
+        spreadsheet
+    )
+
+    print(
+        f"Lookback period: "
+        f"{lookback_days} days"
+    )
+
     sources = get_active_sources(
         spreadsheet
     )
 
-    lookback_days = int(
-    get_setting(
-        spreadsheet,
-        "lookback_days",
-        7,
-    )
-)
-
-print(
-    f"Lookback period: "
-    f"{lookback_days} days"
-)
-    
     print(
         f"Active sources: "
         f"{len(sources)}"
     )
 
     all_articles = []
-
     source_results = []
 
     for source in sources:
@@ -779,35 +820,33 @@ print(
         )
 
         try:
-            articles = collect_source(
+            candidates = collect_source(
                 source
             )
 
-            normalized_articles = (
-                normalize_articles(
-                    articles
-                )
+            normalized = normalize_articles(
+                candidates
             )
-            
+
             recent_articles = [
                 article
-                for article in normalized_articles
+                for article in normalized
                 if is_recent_article(
                     article.get(
                         "published_at",
-                        ""
+                        "",
                     ),
                     lookback_days,
                 )
             ]
-            
+
             print(
                 f"[{name}] "
-                f"{len(recent_articles)} recent articles "
-                f"out of "
-                f"{len(normalized_articles)} candidates."
+                f"{len(recent_articles)} recent "
+                f"articles out of "
+                f"{len(normalized)} candidates."
             )
-            
+
             all_articles.extend(
                 recent_articles
             )
@@ -817,7 +856,10 @@ print(
                     "name": name,
                     "status": "OK",
                     "count": len(
-                        normalized_articles
+                        recent_articles
+                    ),
+                    "candidates": len(
+                        normalized
                     ),
                     "error": "",
                 }
@@ -833,6 +875,7 @@ print(
                     "name": name,
                     "status": "ERROR",
                     "count": 0,
+                    "candidates": 0,
                     "error": str(e),
                 }
             )
@@ -846,7 +889,8 @@ print(
         print(
             f"{result['name']}: "
             f"{result['status']} "
-            f"({result['count']} articles)"
+            f"({result['count']} recent / "
+            f"{result['candidates']} candidates)"
         )
 
         if result["error"]:
@@ -858,7 +902,7 @@ print(
     print("=" * 60)
 
     print(
-        f"Total candidates collected: "
+        f"Total recent articles: "
         f"{len(all_articles)}"
     )
 
@@ -868,7 +912,8 @@ print(
     )
 
     print(
-        f"New articles saved: {saved}"
+        f"New articles saved: "
+        f"{saved}"
     )
 
 
