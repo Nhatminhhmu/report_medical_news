@@ -1,0 +1,25 @@
+name: Test AHRQ Parser
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-ahrq:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install requests beautifulsoup4
+
+      - name: Run AHRQ parser
+        run: |
+          python parsers/ahrq_psnet.py
