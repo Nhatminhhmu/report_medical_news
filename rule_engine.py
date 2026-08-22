@@ -403,13 +403,6 @@ def process_articles(
         # Skip already evaluated articles
         current_score = clean_text(
             article.get(
-                "relevance_score",
-                "",
-            )
-        )
-
-        current_score = clean_text(
-            article.get(
                 "rule_score",
                 "",
             )
@@ -450,7 +443,7 @@ def process_articles(
                     )}"
                 ),
                 "values": [
-                    [topic]
+                    [matched_topics]
                 ],
             }
         )
