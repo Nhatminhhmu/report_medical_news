@@ -1,7 +1,7 @@
 import json
 import os
 import hashlib
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from urllib.parse import urljoin
 
 import feedparser
@@ -178,6 +178,68 @@ def get_active_sources(
 
     return sources
 
+def get_setting(
+    spreadsheet,
+    key,
+    default=None,
+):
+    worksheet = spreadsheet.worksheet(
+        "Settings"
+    )
+
+    records = worksheet.get_all_records()
+
+    for row in records:
+        row_key = clean_text(
+            row.get("key", "")
+        )
+
+        if row_key == key:
+            return clean_text(
+                row.get("value", "")
+            )
+
+    return default
+
+
+def is_recent_article(
+    published_at,
+    lookback_days,
+):
+    if not published_at:
+        return True
+
+    try:
+        parsed = feedparser._parse_date(
+            published_at
+        )
+
+        if not parsed:
+            return True
+
+        published = datetime(
+            parsed.tm_year,
+            parsed.tm_mon,
+            parsed.tm_mday,
+            parsed.tm_hour,
+            parsed.tm_min,
+            parsed.tm_sec,
+            tzinfo=timezone.utc,
+        )
+
+        cutoff = (
+            datetime.now(timezone.utc)
+            - timedelta(
+                days=lookback_days
+            )
+        )
+
+        return published >= cutoff
+
+    except Exception:
+        # Nếu không parse được ngày,
+        # tạm thời giữ bài để tránh mất dữ liệu.
+        return True
 
 # ============================================================
 # RSS COLLECTOR
@@ -686,6 +748,19 @@ def main():
         spreadsheet
     )
 
+    lookback_days = int(
+    get_setting(
+        spreadsheet,
+        "lookback_days",
+        7,
+    )
+)
+
+print(
+    f"Lookback period: "
+    f"{lookback_days} days"
+)
+    
     print(
         f"Active sources: "
         f"{len(sources)}"
@@ -713,9 +788,28 @@ def main():
                     articles
                 )
             )
-
+            
+            recent_articles = [
+                article
+                for article in normalized_articles
+                if is_recent_article(
+                    article.get(
+                        "published_at",
+                        ""
+                    ),
+                    lookback_days,
+                )
+            ]
+            
+            print(
+                f"[{name}] "
+                f"{len(recent_articles)} recent articles "
+                f"out of "
+                f"{len(normalized_articles)} candidates."
+            )
+            
             all_articles.extend(
-                normalized_articles
+                recent_articles
             )
 
             source_results.append(
