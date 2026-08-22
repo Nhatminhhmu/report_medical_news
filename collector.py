@@ -772,9 +772,13 @@ def main():
                 source
             )
 
-            all_articles.extend(
-                articles
-            )
+            normalized_articles = normalize_articles(
+    			articles
+			)
+
+			all_articles.extend(
+    			normalized_articles
+			)
 
             source_results.append(
                 {
