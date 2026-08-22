@@ -11,6 +11,7 @@ from bs4 import BeautifulSoup
 
 from google.oauth2.service_account import Credentials
 
+from parsers import himss
 
 # ============================================================
 # CONFIGURATION
@@ -485,6 +486,13 @@ def collect_source(
     source,
 ):
 
+    name = clean_text(
+        source.get(
+            "name",
+            "",
+        )
+    )
+
     access_method = (
         clean_text(
             source.get(
@@ -494,6 +502,20 @@ def collect_source(
         )
         .upper()
     )
+
+    # --------------------------------------------------------
+    # Source-specific parser
+    # --------------------------------------------------------
+
+    if name.lower() == "himss":
+
+        return himss.collect(
+            source
+        )
+
+    # --------------------------------------------------------
+    # Generic collectors
+    # --------------------------------------------------------
 
     if access_method == "RSS":
 
@@ -548,6 +570,70 @@ def get_existing_article_ids(
             "",
         )
     }
+
+
+def normalize_articles(
+    articles,
+):
+
+    normalized = []
+
+    for article in articles:
+
+        url = clean_text(
+            article.get(
+                "url",
+                "",
+            )
+        )
+
+        title = clean_text(
+            article.get(
+                "title",
+                "",
+            )
+        )
+
+        if not url or not title:
+            continue
+
+        normalized.append(
+            {
+                "article_id": make_article_id(
+                    url
+                ),
+                "source": clean_text(
+                    article.get(
+                        "source",
+                        "",
+                    )
+                ),
+                "title": title,
+                "url": url,
+                "published_at": clean_text(
+                    article.get(
+                        "published_at",
+                        "",
+                    )
+                ),
+                "excerpt": clean_text(
+                    article.get(
+                        "excerpt",
+                        "",
+                    )
+                ),
+                "topic": clean_text(
+                    article.get(
+                        "topic",
+                        "",
+                    )
+                ),
+                "status": "DISCOVERED",
+                "discovered_at": utc_now(),
+            }
+        )
+
+    return normalized
 
 
 # ============================================================
