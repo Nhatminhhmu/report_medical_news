@@ -153,6 +153,12 @@ def get_active_topics(
                         "",
                     )
                 ),
+                "context_terms": parse_keywords(
+                    row.get(
+                        "context_terms",
+                        "",
+                    )
+                ),
                 "exclusions": parse_keywords(
                     row.get(
                         "exclusions",
@@ -212,168 +218,180 @@ def keyword_matches(
 # SCORE ARTICLE
 # ============================================================
 
+
+# ============================================================
+# RULE ENGINE SETTINGS
+# ============================================================
+
+DEFAULT_RULE_SETTINGS = {
+    "rule_engine_version": "1.2",
+    "keyword_title_weight": 30,
+    "keyword_excerpt_weight": 15,
+    "related_title_weight": 10,
+    "related_excerpt_weight": 5,
+    "context_title_weight": 8,
+    "context_excerpt_weight": 3,
+    "priority_weight": 5,
+    "max_rule_score": 100,
+    "minimum_score": 70,
+    "require_context_for_related_only": True,
+}
+
+
+def parse_bool_setting(value, default):
+    if value is None:
+        return default
+    normalized = str(value).strip().lower()
+    if normalized in {"true", "1", "yes", "y"}:
+        return True
+    if normalized in {"false", "0", "no", "n"}:
+        return False
+    return default
+
+
+def parse_number_setting(value, default):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def load_rule_settings(spreadsheet):
+    try:
+        worksheet = spreadsheet.worksheet("Settings")
+        rows = worksheet.get_all_records()
+    except Exception as exc:
+        print(f"[SETTINGS] Warning: could not load Settings: {exc}")
+        return DEFAULT_RULE_SETTINGS.copy()
+
+    settings = DEFAULT_RULE_SETTINGS.copy()
+
+    for row in rows:
+        key = str(row.get("key", "")).strip()
+        if key not in settings:
+            continue
+
+        raw_value = row.get("value")
+
+        if key == "rule_engine_version":
+            value = str(raw_value).strip()
+            if value:
+                settings[key] = value
+        elif key == "require_context_for_related_only":
+            settings[key] = parse_bool_setting(raw_value, settings[key])
+        else:
+            settings[key] = parse_number_setting(raw_value, settings[key])
+
+    for key in (
+        "keyword_title_weight",
+        "keyword_excerpt_weight",
+        "related_title_weight",
+        "related_excerpt_weight",
+        "context_title_weight",
+        "context_excerpt_weight",
+        "priority_weight",
+        "max_rule_score",
+        "minimum_score",
+    ):
+        settings[key] = int(settings[key])
+
+    print(f"[SETTINGS] Rule Engine v{settings['rule_engine_version']}")
+    print(
+        "[SETTINGS] "
+        f"keyword={settings['keyword_title_weight']}/"
+        f"{settings['keyword_excerpt_weight']}, "
+        f"related={settings['related_title_weight']}/"
+        f"{settings['related_excerpt_weight']}, "
+        f"context={settings['context_title_weight']}/"
+        f"{settings['context_excerpt_weight']}, "
+        f"priority={settings['priority_weight']}, "
+        f"max={settings['max_rule_score']}, "
+        f"minimum={settings['minimum_score']}, "
+        f"require_context={settings['require_context_for_related_only']}"
+    )
+    return settings
+
 def evaluate_article(
     article,
     topics,
+    settings,
 ):
     """
-    Evaluate an article against active topics.
+    Rule Engine v1.2.
 
-    Scoring model:
-      - Exact keyword in title:       30 points
-      - Exact keyword in excerpt:     15 points
-      - Related term in title:       18 points
-      - Related term in excerpt:      8 points
-      - Topic priority bonus:        5 * priority
+    Primary keyword: title +30, excerpt +15
+    Related term:    title +10, excerpt +5
+    Context term:    title +8, excerpt +3
+    Priority bonus:  +5 * priority
 
-    The highest topic score becomes the article's rule_score.
+    A topic matches when it has either:
+      1) a primary keyword, OR
+      2) a related term AND a context term.
 
-    Exclusions override both keywords and related terms.
+    Exclusions override all positive matches.
     """
-
-    title = normalize_text(
-        article.get(
-            "title",
-            "",
-        )
-    )
-
-    excerpt = normalize_text(
-        article.get(
-            "excerpt",
-            "",
-        )
-    )
-
-    text = (
-        title
-        + " "
-        + excerpt
-    )
+    title = normalize_text(article.get("title", ""))
+    excerpt = normalize_text(article.get("excerpt", ""))
+    text = title + " " + excerpt
 
     matched_topics = []
     all_keywords = []
     all_related_terms = []
+    all_context_terms = []
 
     for topic in topics:
+        keywords = [
+            k for k in topic.get("keywords", [])
+            if keyword_matches(text, k)
+        ]
+        related = [
+            k for k in topic.get("related_terms", [])
+            if keyword_matches(text, k)
+        ]
+        context = [
+            k for k in topic.get("context_terms", [])
+            if keyword_matches(text, k)
+        ]
+        excluded = [
+            k for k in topic.get("exclusions", [])
+            if keyword_matches(text, k)
+        ]
 
-        keyword_matches_found = []
-        related_matches_found = []
-
-        # Primary/high-confidence signals.
-        for keyword in topic.get(
-            "keywords",
-            [],
-        ):
-            if keyword_matches(
-                text,
-                keyword,
-            ):
-                keyword_matches_found.append(
-                    keyword
-                )
-
-        # Secondary/contextual signals.
-        for term in topic.get(
-            "related_terms",
-            [],
-        ):
-            if keyword_matches(
-                text,
-                term,
-            ):
-                related_matches_found.append(
-                    term
-                )
-
-        excluded = []
-
-        for keyword in topic.get(
-            "exclusions",
-            [],
-        ):
-            if keyword_matches(
-                text,
-                keyword,
-            ):
-                excluded.append(
-                    keyword
-                )
-
-        # Exclusion overrides all positive signals.
         if excluded:
-            keyword_matches_found = []
-            related_matches_found = []
-
-        if (
-            not keyword_matches_found
-            and not related_matches_found
-        ):
             continue
 
-        keyword_title_matches = sum(
-            1
-            for keyword
-            in keyword_matches_found
-            if keyword_matches(
-                title,
-                keyword,
-            )
+        if not keywords:
+            if settings["require_context_for_related_only"]:
+                if not (related and context):
+                    continue
+            elif not related:
+                continue
+
+        kt = sum(keyword_matches(title, k) for k in keywords)
+        ke = len(keywords) - kt
+        rt = sum(keyword_matches(title, k) for k in related)
+        re_ = len(related) - rt
+        ct = sum(keyword_matches(title, k) for k in context)
+        ce = len(context) - ct
+
+        score = min(
+            kt * settings["keyword_title_weight"]
+            + ke * settings["keyword_excerpt_weight"]
+            + rt * settings["related_title_weight"]
+            + re_ * settings["related_excerpt_weight"]
+            + ct * settings["context_title_weight"]
+            + ce * settings["context_excerpt_weight"]
+            + topic.get("priority", 1) * settings["priority_weight"],
+            settings["max_rule_score"],
         )
 
-        keyword_excerpt_matches = (
-            len(keyword_matches_found)
-            - keyword_title_matches
-        )
-
-        related_title_matches = sum(
-            1
-            for term
-            in related_matches_found
-            if keyword_matches(
-                title,
-                term,
-            )
-        )
-
-        related_excerpt_matches = (
-            len(related_matches_found)
-            - related_title_matches
-        )
-
-        topic_score = (
-            keyword_title_matches * 30
-            + keyword_excerpt_matches * 15
-            + related_title_matches * 18
-            + related_excerpt_matches * 8
-            + topic.get(
-                "priority",
-                1,
-            ) * 5
-        )
-
-        topic_score = min(
-            topic_score,
-            100,
-        )
-
-        matched_topics.append(
-            {
-                "name": topic.get(
-                    "name",
-                    "",
-                ),
-                "score": topic_score,
-            }
-        )
-
-        all_keywords.extend(
-            keyword_matches_found
-        )
-
-        all_related_terms.extend(
-            related_matches_found
-        )
+        matched_topics.append({
+            "name": topic.get("name", ""),
+            "score": score,
+        })
+        all_keywords.extend(keywords)
+        all_related_terms.extend(related)
+        all_context_terms.extend(context)
 
     if not matched_topics:
         return {
@@ -381,40 +399,22 @@ def evaluate_article(
             "rule_score": 0,
             "matched_keywords": [],
             "matched_related_terms": [],
+            "matched_context_terms": [],
         }
 
-    # Highest topic score determines overall article score.
     matched_topics.sort(
-        key=lambda item: item[
-            "score"
-        ],
+        key=lambda item: item["score"],
         reverse=True,
-    )
-
-    best_score = matched_topics[0][
-        "score"
-    ]
-
-    all_keywords = list(
-        dict.fromkeys(
-            all_keywords
-        )
-    )
-
-    all_related_terms = list(
-        dict.fromkeys(
-            all_related_terms
-        )
     )
 
     return {
         "matched_topics": [
-            item["name"]
-            for item in matched_topics
+            item["name"] for item in matched_topics
         ],
-        "rule_score": best_score,
-        "matched_keywords": all_keywords,
-        "matched_related_terms": all_related_terms,
+        "rule_score": matched_topics[0]["score"],
+        "matched_keywords": list(dict.fromkeys(all_keywords)),
+        "matched_related_terms": list(dict.fromkeys(all_related_terms)),
+        "matched_context_terms": list(dict.fromkeys(all_context_terms)),
     }
 
 
@@ -425,6 +425,7 @@ def evaluate_article(
 def process_articles(
     spreadsheet,
     topics,
+    settings,
 ):
 
     worksheet = spreadsheet.worksheet(
@@ -459,6 +460,7 @@ def process_articles(
         "rule_score",
         "matched_keywords",
         "matched_related_terms",
+        "matched_context_terms",
     ]
 
     for header in required_headers:
@@ -491,6 +493,7 @@ def process_articles(
         result = evaluate_article(
             article,
             topics,
+            settings,
         )
 
         matched_topics = ", ".join(
@@ -512,6 +515,12 @@ def process_articles(
         matched_related_terms = ", ".join(
             result[
                 "matched_related_terms"
+            ]
+        )
+
+        matched_context_terms = ", ".join(
+            result[
+                "matched_context_terms"
             ]
         )
 
@@ -579,6 +588,22 @@ def process_articles(
             }
         )
 
+        updates.append(
+            {
+                "range": (
+                    f"{gspread.utils.rowcol_to_a1(
+                        row_number,
+                        header_index[
+                            "matched_context_terms"
+                        ]
+                    )}"
+                ),
+                "values": [
+                    [matched_context_terms]
+                ],
+            }
+        )
+
         print(
             f"{article.get('title', '')[:80]}"
         )
@@ -602,6 +627,11 @@ def process_articles(
             f"  Related terms: "
             f"{matched_related_terms or 'NONE'}"
         )
+
+        print(
+            f"  Context terms: "
+            f"{matched_context_terms or 'NONE'}"
+        )
     if not updates:
 
         print(
@@ -616,7 +646,7 @@ def process_articles(
 
     print(
         f"Updated "
-        f"{len(updates) // 4} articles."
+        f"{len(updates) // 5} articles."
     )
 
 
@@ -633,6 +663,10 @@ def main():
         f"{spreadsheet.title}"
     )
 
+    settings = load_rule_settings(
+        spreadsheet
+    )
+
     topics = get_active_topics(
         spreadsheet
     )
@@ -645,6 +679,7 @@ def main():
     process_articles(
         spreadsheet,
         topics,
+        settings,
     )
 
 
