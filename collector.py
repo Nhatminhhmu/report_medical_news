@@ -176,29 +176,163 @@ def get_lookback_days(
 def parse_published_date(
     published_at,
 ):
+    """
+    Parse publication dates from common RSS/WEB formats.
+
+    Supported examples:
+    - Wed, 13 May 2026 15:37:53 GMT
+    - Wed, 13 May 2026 15:37:53 +0000
+    - March 12, 2025
+    - March 12, 2025 10:30 AM
+    - 2026-08-22T10:30:00Z
+    - 2026-08-22T10:30:00+07:00
+    """
+
     if not published_at:
         return None
 
-    try:
-        parsed = feedparser._parse_date(
-            published_at
-        )
+    value = clean_text(
+        published_at
+    )
 
-        if not parsed:
-            return None
-
-        return datetime(
-            parsed.tm_year,
-            parsed.tm_mon,
-            parsed.tm_mday,
-            parsed.tm_hour,
-            parsed.tm_min,
-            parsed.tm_sec,
-            tzinfo=timezone.utc,
-        )
-
-    except Exception:
+    if not value:
         return None
+
+    # --------------------------------------------------------
+    # 1. RFC 2822 / RSS dates
+    #
+    # Example:
+    # Wed, 13 May 2026 15:37:53 GMT
+    # --------------------------------------------------------
+
+    try:
+        from email.utils import (
+            parsedate_to_datetime
+        )
+
+        parsed = parsedate_to_datetime(
+            value
+        )
+
+        if parsed is not None:
+
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(
+                    tzinfo=timezone.utc
+                )
+
+            return parsed.astimezone(
+                timezone.utc
+            )
+
+    except (TypeError, ValueError, OverflowError):
+        pass
+
+    # --------------------------------------------------------
+    # 2. ISO 8601
+    #
+    # Examples:
+    # 2026-08-22T10:30:00Z
+    # 2026-08-22T10:30:00+07:00
+    # --------------------------------------------------------
+
+    try:
+        iso_value = value
+
+        if iso_value.endswith(
+            "Z"
+        ):
+            iso_value = (
+                iso_value[:-1]
+                + "+00:00"
+            )
+
+        parsed = datetime.fromisoformat(
+            iso_value
+        )
+
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(
+                tzinfo=timezone.utc
+            )
+
+        return parsed.astimezone(
+            timezone.utc
+        )
+
+    except (TypeError, ValueError):
+        pass
+
+    # --------------------------------------------------------
+    # 3. Month-name formats
+    #
+    # Examples:
+    # March 12, 2025
+    # March 12, 2025 10:30 AM
+    # --------------------------------------------------------
+
+    date_formats = [
+        "%B %d, %Y",
+        "%B %d, %Y %I:%M %p",
+        "%b %d, %Y",
+        "%b %d, %Y %I:%M %p",
+    ]
+
+    for date_format in date_formats:
+
+        try:
+            parsed = datetime.strptime(
+                value,
+                date_format,
+            )
+
+            return parsed.replace(
+                tzinfo=timezone.utc
+            )
+
+        except ValueError:
+            pass
+
+    # --------------------------------------------------------
+    # 4. Date-only formats
+    #
+    # Examples:
+    # 2026-08-22
+    # 2026/08/22
+    # 22/08/2026
+    # --------------------------------------------------------
+
+    date_only_formats = [
+        "%Y-%m-%d",
+        "%Y/%m/%d",
+        "%d/%m/%Y",
+    ]
+
+    for date_format in date_only_formats:
+
+        try:
+            parsed = datetime.strptime(
+                value,
+                date_format,
+            )
+
+            return parsed.replace(
+                tzinfo=timezone.utc
+            )
+
+        except ValueError:
+            pass
+
+    # --------------------------------------------------------
+    # Unable to parse
+    # --------------------------------------------------------
+
+    print(
+        f"[DATE] Unable to parse: "
+        f"{value}"
+    )
+
+    return None
 
 
 def is_recent_article(
@@ -206,14 +340,24 @@ def is_recent_article(
     lookback_days,
 ):
     if not published_at:
-        return True
+        print(
+            "[DATE] Missing published_at. "
+            "Article will be excluded."
+        )
+
+        return False
 
     published = parse_published_date(
         published_at
     )
 
     if published is None:
-        return True
+        print(
+            f"[DATE] Could not parse "
+            f"published_at: {published_at}"
+        )
+
+        return False
 
     cutoff = (
         datetime.now(timezone.utc)
@@ -222,7 +366,17 @@ def is_recent_article(
         )
     )
 
-    return published >= cutoff
+    is_recent = (
+        published >= cutoff
+    )
+
+    if not is_recent:
+        print(
+            f"[DATE] Excluding old article: "
+            f"{published_at}"
+        )
+
+    return is_recent
 
 
 # ============================================================
