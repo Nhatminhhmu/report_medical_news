@@ -19,7 +19,7 @@ from openai import OpenAI
 # CONFIG
 # ============================================================
 
-VERSION = "0.7"
+VERSION = "0.7.2"
 
 DEFAULT_MODEL = "gpt-5.6-luna"
 DEFAULT_LANGUAGE = "Vietnamese"
@@ -76,8 +76,9 @@ BRIEFING_HEADERS = [
     "metric_5_reason",
 
     "reading_score",
-    "rank",
-    "selected",
+    "report_selected",
+    "report_rank",
+    "report_selection_method",
     "model",
     "created_at",
     "status",
@@ -559,7 +560,7 @@ def call_openai(
         },
         max_output_tokens=max_output_tokens,
         store=False,
-        prompt_cache_key="medical-news-briefing-v07",
+        prompt_cache_key="medical-news-briefing-v072",
     )
 
     return parse_json_safely(response.output_text)
@@ -891,8 +892,11 @@ def build_briefing_row(
             result.get("implications")
         ),
         "reading_score": reading_score,
-        "rank": "",
-        "selected": "",
+        # Report selection is intentionally left blank here.
+        # The downstream reading/report selection engine owns these fields.
+        "report_selected": "",
+        "report_rank": "",
+        "report_selection_method": "",
         "model": model,
         "created_at": now_iso(),
         "status": "success",
@@ -957,6 +961,13 @@ def ensure_briefings_header(worksheet):
         return
 
     existing_headers = existing[0]
+
+    if len(existing_headers) != len(set(existing_headers)):
+        raise ValueError(
+            f"{BRIEFINGS_SHEET} contains duplicate header names. "
+            f"Expected one column per field.\n"
+            f"Found:\n{existing_headers}"
+        )
 
     if existing_headers != BRIEFING_HEADERS:
         raise ValueError(
