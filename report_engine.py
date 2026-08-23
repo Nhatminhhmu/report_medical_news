@@ -17,7 +17,7 @@ from openai import OpenAI
 # CONFIG
 # ============================================================
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 
 BRIEFINGS_SHEET = "Briefings"
 
@@ -909,18 +909,14 @@ def split_telegram_message(
 
 def send_telegram(
     message: str,
+    enabled: bool,
 ) -> None:
 
-    enabled = normalize_bool(
-        os.getenv(
-            "TELEGRAM_ENABLED",
-            "false",
-        )
-    )
-
+    # Delivery switch is configured in Google Sheets Settings.
+    # Credentials remain in GitHub Secrets / environment variables.
     if not enabled:
         print(
-            "[TELEGRAM] Disabled. "
+            "[TELEGRAM] Disabled by Settings. "
             "Report printed locally."
         )
         print("\n" + message)
@@ -1163,7 +1159,23 @@ def main():
         language=language,
     )
 
-    send_telegram(message)
+    telegram_enabled = normalize_bool(
+        setting(
+            settings,
+            "telegram_enabled",
+            False,
+        )
+    )
+
+    print(
+        f"[SETTINGS] telegram_enabled="
+        f"{telegram_enabled}"
+    )
+
+    send_telegram(
+        message,
+        enabled=telegram_enabled,
+    )
 
     print("=" * 60)
     print("REPORT SUMMARY")
