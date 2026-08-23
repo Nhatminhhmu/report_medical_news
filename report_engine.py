@@ -5,6 +5,7 @@ import math
 import os
 import re
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import gspread
@@ -17,7 +18,7 @@ from openai import OpenAI
 # CONFIG
 # ============================================================
 
-VERSION = "1.0.1"
+VERSION = "1.1.0"
 
 BRIEFINGS_SHEET = "Briefings"
 
@@ -38,6 +39,8 @@ GOOGLE_SCOPES = [
 OPENAI_PROMPT_CACHE_KEY = "medical-news-report-v1"
 
 TELEGRAM_API = "https://api.telegram.org"
+
+SITE_DIR = Path("site")
 
 
 # ============================================================
@@ -957,6 +960,349 @@ def send_telegram(
     )
 
 
+import html
+
+def esc(value: Any) -> str:
+    return html.escape("" if value is None else str(value), quote=True)
+
+
+def render_list(items: list[str]) -> str:
+    if not items:
+        return ""
+    return "\n".join(f"<li>{esc(item)}</li>" for item in items)
+
+
+def render_articles(report: dict, selected: list[dict]) -> str:
+    notes = {
+        str(item.get("article_id", "")).strip(): str(item.get("editorial_note", "")).strip()
+        for item in (report.get("selected_articles") or [])
+    }
+
+    blocks = []
+    for rank, row in enumerate(selected, 1):
+        article_id = str(row.get("article_id", "")).strip()
+        title = esc(row.get("title", ""))
+        source = esc(row.get("source", ""))
+        score = float(row.get("reading_score") or 0)
+        url = str(row.get("url", "")).strip()
+        note = esc(notes.get(article_id, ""))
+
+        link = (
+            f'<a class="source-link" href="{esc(url)}" target="_blank" '
+            f'rel="noopener noreferrer">Đọc bài gốc →</a>'
+            if url else ""
+        )
+
+        blocks.append(f"""
+        <article class="article-card">
+          <div class="article-number">{rank:02d}</div>
+          <div class="article-body">
+            <div class="eyebrow">{source} · Reading Score {score:.1f}</div>
+            <h3>{title}</h3>
+            <p>{note}</p>
+            {link}
+          </div>
+        </article>
+        """.strip())
+
+    return "\n".join(blocks)
+
+
+def render_report_html(
+    report: dict,
+    selected: list[dict],
+    run_id: str,
+    report_date: str,
+) -> str:
+    headline = esc(report.get("headline") or "Medical News Report")
+    executive = esc(report.get("executive_summary") or "")
+    themes = render_list(report.get("key_themes") or [])
+    takeaways = render_list(report.get("strategic_takeaways") or [])
+    implications = render_list(report.get("vietnam_implications") or [])
+    articles = render_articles(report, selected)
+
+    return f"""<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="{esc(executive[:180])}">
+  <title>{headline} — Medical News Report</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="nav-wrap">
+    <a class="brand" href="../index.html">
+      <span class="brand-mark">MN</span>
+      <span><strong>MEDICAL NEWS</strong><small>HEALTHCARE INTELLIGENCE</small></span>
+    </a>
+    <nav>
+      <a href="../index.html">Latest</a>
+      <a href="../archive.html">Archive</a>
+    </nav>
+  </div>
+</header>
+
+<main class="reading">
+  <div class="container">
+    <div class="report-meta">
+      <span>{esc(report_date)}</span>
+      <span>{len(selected)} bài đáng đọc</span>
+      <span>Run {esc(run_id)}</span>
+    </div>
+
+    <h1>{headline}</h1>
+
+    <section class="section">
+      <div class="section-label">Executive Summary</div>
+      <p class="lead">{executive}</p>
+    </section>
+
+    <section class="section">
+      <div class="section-label">Key Themes</div>
+      <ol class="numbered-list">{themes}</ol>
+    </section>
+
+    <section class="section">
+      <div class="section-label">Strategic Takeaways</div>
+      <ol class="numbered-list">{takeaways}</ol>
+    </section>
+
+    <section class="section">
+      <div class="section-label">Implications for Vietnam</div>
+      <ol class="numbered-list">{implications}</ol>
+    </section>
+
+    <section class="section">
+      <div class="section-label">Selected Articles</div>
+      <div class="article-list">{articles}</div>
+    </section>
+
+    <footer class="report-footer">
+      <span>Medical News Report · {esc(report_date)}</span>
+      <a href="../archive.html">← Archive</a>
+    </footer>
+  </div>
+</main>
+</body>
+</html>
+"""
+
+
+def _archive_entry(date_str: str, headline: str, count: int) -> str:
+    dt = datetime.strptime(date_str, "%Y-%m-%d")
+    return f"""
+<a class="archive-card" href="reports/{esc(date_str)}.html">
+  <div>
+    <span class="date-large">{dt.day:02d}</span>
+    <span class="month">{dt.strftime("%b").upper()}</span>
+  </div>
+  <div>
+    <h2>{esc(headline)}</h2>
+    <p>{count} bài đáng đọc</p>
+  </div>
+  <span class="arrow">→</span>
+</a>
+""".strip()
+
+
+def render_archive_html(entries: list[dict]) -> str:
+    cards = "\n".join(
+        _archive_entry(e["date"], e["headline"], e["count"])
+        for e in sorted(entries, key=lambda x: x["date"], reverse=True)
+    )
+
+    return f"""<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Archive — Medical News Report</title>
+  <link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="nav-wrap">
+    <a class="brand" href="index.html">
+      <span class="brand-mark">MN</span>
+      <span><strong>MEDICAL NEWS</strong><small>HEALTHCARE INTELLIGENCE</small></span>
+    </a>
+    <nav>
+      <a href="index.html">Latest</a>
+      <a class="active" href="archive.html">Archive</a>
+    </nav>
+  </div>
+</header>
+
+<main class="archive">
+  <div class="container">
+    <div class="eyebrow">Medical News Report</div>
+    <h1>Archive</h1>
+    <p class="archive-intro">Daily intelligence briefings, organized chronologically.</p>
+    <section class="archive-section">
+      <div class="archive-month">Daily Reports</div>
+      {cards}
+    </section>
+  </div>
+</main>
+</body>
+</html>
+"""
+
+
+def render_index_html(
+    latest_date: str,
+    latest_headline: str,
+    latest_count: int,
+) -> str:
+    return f"""<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Medical News Report — Healthcare Intelligence">
+  <title>Medical News Report</title>
+  <link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="nav-wrap">
+    <a class="brand" href="index.html">
+      <span class="brand-mark">MN</span>
+      <span><strong>MEDICAL NEWS</strong><small>HEALTHCARE INTELLIGENCE</small></span>
+    </a>
+    <nav>
+      <a class="active" href="index.html">Latest</a>
+      <a href="archive.html">Archive</a>
+    </nav>
+  </div>
+</header>
+
+<main class="home">
+  <section class="hero">
+    <div class="container">
+      <div class="eyebrow">Healthcare Intelligence · Daily</div>
+      <h1>Medical News Report</h1>
+      <p class="hero-summary">
+        A concise daily briefing on healthcare management, hospital operations,
+        health technology, strategy and business.
+      </p>
+      <div class="hero-actions">
+        <a class="button" href="reports/{esc(latest_date)}.html">Read latest report</a>
+        <span>{esc(latest_date)} · {latest_count} bài đáng đọc</span>
+      </div>
+    </div>
+  </section>
+
+  <section class="recent">
+    <div class="container">
+      <div class="section-label">Latest Report</div>
+      <a class="archive-card" href="reports/{esc(latest_date)}.html">
+        <div>
+          <span class="date-large">{datetime.strptime(latest_date, "%Y-%m-%d").day:02d}</span>
+          <span class="month">{datetime.strptime(latest_date, "%Y-%m-%d").strftime("%b").upper()}</span>
+        </div>
+        <div>
+          <h2>{esc(latest_headline)}</h2>
+          <p>{latest_count} bài đáng đọc</p>
+        </div>
+        <span class="arrow">→</span>
+      </a>
+      <a class="archive-link" href="archive.html">View all reports →</a>
+    </div>
+  </section>
+</main>
+</body>
+</html>
+"""
+
+
+def write_report_site(
+    report: dict,
+    selected: list[dict],
+    run_id: str,
+    report_date: str | None = None,
+    site_dir: str | Path = SITE_DIR,
+) -> Path:
+    """Write the daily report and rebuild the lightweight static archive."""
+    site = Path(site_dir)
+    reports_dir = site / "reports"
+    assets_dir = site / "assets"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    assets_dir.mkdir(parents=True, exist_ok=True)
+
+    date_str = report_date or datetime.now().strftime("%Y-%m-%d")
+    report_path = reports_dir / f"{date_str}.html"
+    report_path.write_text(
+        render_report_html(report, selected, run_id, date_str),
+        encoding="utf-8",
+    )
+
+    target_css = assets_dir / "style.css"
+    if not target_css.exists():
+        target_css.write_text('body{font-family:"Segoe UI","Noto Sans",Arial,sans-serif;max-width:900px;margin:40px auto;padding:0 20px;line-height:1.7}', encoding="utf-8")
+
+    entries = []
+    for path in reports_dir.glob("*.html"):
+        if path.stem == date_str:
+            current_report = report
+            current_count = len(selected)
+        else:
+            current_report = None
+            current_count = 0
+
+        if current_report is not None:
+            headline = current_report.get("headline") or "Medical News Report"
+        else:
+            # Existing reports are intentionally left intact; archive entries
+            # can be populated from a small sidecar index in future versions.
+            continue
+
+        entries.append({
+            "date": path.stem,
+            "headline": headline,
+            "count": current_count,
+        })
+
+    # Preserve prior archive entries through a generated manifest.
+    manifest = site / ".report_index.json"
+    if manifest.exists():
+        import json
+        try:
+            old = json.loads(manifest.read_text(encoding="utf-8"))
+            if isinstance(old, list):
+                entries.extend(old)
+        except Exception:
+            pass
+
+    dedup = {e["date"]: e for e in entries if e.get("date")}
+    manifest.write_text(
+        __import__("json").dumps(
+            list(sorted(dedup.values(), key=lambda x: x["date"], reverse=True)),
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    entries = list(dedup.values())
+    (site / "archive.html").write_text(
+        render_archive_html(entries),
+        encoding="utf-8",
+    )
+    (site / "index.html").write_text(
+        render_index_html(date_str, report.get("headline") or "Medical News Report", len(selected)),
+        encoding="utf-8",
+    )
+
+    print(f"[SITE] Report written: {report_path}")
+    print(f"[SITE] Archive updated: {site / 'archive.html'}")
+    return report_path
+
+
+
+
 # ============================================================
 # MAIN
 # ============================================================
@@ -1176,6 +1522,18 @@ def main():
         message,
         enabled=telegram_enabled,
     )
+
+    try:
+        write_report_site(
+            report=report,
+            selected=selected,
+            run_id=run_id,
+            report_date=datetime.now().strftime("%Y-%m-%d"),
+            site_dir=SITE_DIR,
+        )
+    except Exception as exc:
+        print(f"[SITE] ERROR: {type(exc).__name__}: {exc}")
+        raise
 
     print("=" * 60)
     print("REPORT SUMMARY")
