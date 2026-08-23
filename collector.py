@@ -25,7 +25,7 @@ RUNS_SHEET = "Runs"
 REQUEST_TIMEOUT = 30
 
 USER_AGENT = (
-    "ReportMedicalNews/0.4 "
+    "ReportMedicalNews/0.5 "
     "(Healthcare Operations Intelligence)"
 )
 
@@ -1082,15 +1082,13 @@ def save_articles(
                 article[
                     "excerpt"
                 ],
+                now_iso(),
+                "DISCOVERED",
                 "",
                 "",
                 "",
-                article[
-                    "status"
-                ],
-                article[
-                    "discovered_at"
-                ],
+                "",
+                "",
             ]
         )
 
