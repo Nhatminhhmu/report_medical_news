@@ -19,7 +19,7 @@ from openai import OpenAI
 # CONFIG
 # ============================================================
 
-VERSION = "0.7.4"
+VERSION = "0.7.5"
 
 DEFAULT_MODEL = "gpt-5.6-luna"
 DEFAULT_LANGUAGE = "Vietnamese"
@@ -1155,24 +1155,34 @@ def process_articles(
         briefings_sheet
     )
 
+    # --------------------------------------------------------
+    # IMPORTANT: every run reloads these values from Settings.
+    # Prefer briefing-specific keys from the current Settings
+    # schema, while keeping backwards-compatible aliases.
+    # --------------------------------------------------------
+
     model = setting(
         settings,
-        "model",
-        DEFAULT_MODEL,
+        "briefing_model",
+        setting(settings, "model", DEFAULT_MODEL),
     )
 
     language = setting(
         settings,
-        "language",
-        DEFAULT_LANGUAGE,
+        "briefing_language",
+        setting(settings, "language", DEFAULT_LANGUAGE),
     )
 
     max_content_chars = int(
         safe_float(
             setting(
                 settings,
-                "max_content_chars",
-                DEFAULT_MAX_CONTENT_CHARS,
+                "briefing_max_content_chars",
+                setting(
+                    settings,
+                    "max_content_chars",
+                    DEFAULT_MAX_CONTENT_CHARS,
+                ),
             ),
             DEFAULT_MAX_CONTENT_CHARS,
         )
@@ -1193,6 +1203,18 @@ def process_articles(
             ),
             DEFAULT_MAX_OUTPUT_TOKENS,
         )
+    )
+
+    # GPT-5.6 Luna currently accepts only its default temperature.
+    # Read the configured value for visibility/auditing, but do not
+    # send it to the API because non-default temperature is rejected.
+    briefing_temperature = safe_float(
+        setting(
+            settings,
+            "briefing_temperature",
+            1,
+        ),
+        1,
     )
 
     custom_prompt = setting(
@@ -1228,6 +1250,13 @@ def process_articles(
     )
     print(
         f"[SETTINGS] language={language}"
+    )
+    print(
+        f"[SETTINGS] temperature={briefing_temperature}"
+        " (API uses default=1)"
+    )
+    print(
+        f"[SETTINGS] max_output_tokens={max_output_tokens}"
     )
     print(
         f"[SETTINGS] active metrics="
