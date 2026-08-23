@@ -15,6 +15,12 @@ SCOPES = [
 TOPICS_SHEET = "Topics"
 ARTICLES_SHEET = "Articles"
 
+# Pipeline status owned by Rule Engine.
+# READY_FOR_BRIEFING means the article passed the configured minimum_score.
+# RULE_REJECTED means it was evaluated but is below the threshold / unmatched.
+STATUS_READY_FOR_BRIEFING = "READY_FOR_BRIEFING"
+STATUS_RULE_REJECTED = "RULE_REJECTED"
+
 
 # ============================================================
 # GOOGLE SHEETS
@@ -223,8 +229,11 @@ def keyword_matches(
 # RULE ENGINE SETTINGS
 # ============================================================
 
+# Emergency fallbacks only.
+# Google Sheets > Settings is the single source of truth during normal runs.
+# If a key exists in Settings, its value overrides the corresponding fallback.
 DEFAULT_RULE_SETTINGS = {
-    "rule_engine_version": "1.3",
+    "rule_engine_version": "1.2",
     "keyword_title_weight": 30,
     "keyword_excerpt_weight": 15,
     "related_title_weight": 10,
@@ -233,7 +242,7 @@ DEFAULT_RULE_SETTINGS = {
     "context_excerpt_weight": 3,
     "priority_weight": 5,
     "max_rule_score": 100,
-    "minimum_score": 70,
+    "minimum_score": 20,
     "require_context_for_related_only": True,
 }
 
@@ -269,6 +278,8 @@ def load_rule_settings(spreadsheet):
     for row in rows:
         key = str(row.get("key", "")).strip()
         if key not in settings:
+            # Settings contains configuration for multiple pipeline stages.
+            # Rule Engine intentionally consumes only its own keys.
             continue
 
         raw_value = row.get("value")
@@ -295,9 +306,21 @@ def load_rule_settings(spreadsheet):
     ):
         settings[key] = int(settings[key])
 
+    if settings["max_rule_score"] <= 0:
+        raise ValueError("Settings.max_rule_score must be > 0.")
+
+    if settings["minimum_score"] < 0:
+        raise ValueError("Settings.minimum_score must be >= 0.")
+
+    if settings["minimum_score"] > settings["max_rule_score"]:
+        raise ValueError(
+            "Settings.minimum_score cannot exceed Settings.max_rule_score."
+        )
+
     print(f"[SETTINGS] Rule Engine v{settings['rule_engine_version']}")
     print(
-        "[SETTINGS] "
+        "[SETTINGS] Loaded from Google Sheets Settings. "
+        "Active values: "
         f"keyword={settings['keyword_title_weight']}/"
         f"{settings['keyword_excerpt_weight']}, "
         f"related={settings['related_title_weight']}/"
@@ -463,6 +486,7 @@ def process_articles(
         "matched_keywords",
         "matched_related_terms",
         "matched_context_terms",
+        "status",
     ]
 
     missing = [
@@ -498,6 +522,9 @@ def process_articles(
         current_score = clean_text(
             article.get("rule_score", "")
         )
+        current_status = clean_text(
+            article.get("status", "")
+        )
 
         if not article_id:
             skipped_count += 1
@@ -526,11 +553,24 @@ def process_articles(
             settings,
         )
 
+        rule_score = result["rule_score"]
+
+        # Rule Engine is the single owner of the transition from a newly
+        # collected article to the next pipeline state.
+        #
+        # >= minimum_score -> eligible for AI Briefing
+        # < minimum_score  -> evaluated but rejected by Rule Engine
+        new_status = (
+            STATUS_READY_FOR_BRIEFING
+            if rule_score >= settings["minimum_score"]
+            else STATUS_RULE_REJECTED
+        )
+
         values_by_header = {
             "matched_topics": ", ".join(
                 result["matched_topics"]
             ),
-            "rule_score": result["rule_score"],
+            "rule_score": rule_score,
             "matched_keywords": ", ".join(
                 result["matched_keywords"]
             ),
@@ -540,6 +580,7 @@ def process_articles(
             "matched_context_terms": ", ".join(
                 result["matched_context_terms"]
             ),
+            "status": new_status,
         }
 
         for header, value in values_by_header.items():
@@ -569,6 +610,10 @@ def process_articles(
         print(
             f"  Rule score: "
             f"{values_by_header['rule_score']}"
+        )
+        print(
+            f"  Status: "
+            f"{values_by_header['status']}"
         )
         print(
             f"  Keywords: "
