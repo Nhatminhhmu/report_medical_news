@@ -1,41 +1,3 @@
-"""
-AI Briefing Engine v0.6
-Medical News Report
-
-Pipeline:
-    Articles
-        ↓
-    Selection
-        ↓
-    Briefing Engine
-        ↓
-    Briefings
-
-Responsibilities:
-- Load selected articles
-- Fetch article content
-- Fallback to Articles.excerpt when source blocks crawling
-- Load active Reading Metrics dynamically from Google Sheets
-- Call OpenAI once per article
-- Generate:
-    * summary
-    * key_points
-    * why_it_matters
-    * implications
-    * metric scores
-    * metric reasons
-- Calculate weighted reading_score locally
-- Store results in Briefings
-
-Design goals:
-- 1 OpenAI call / article
-- No hard-coded Reading Metrics
-- Structured Outputs
-- Skip already successful briefings
-- Minimize article content sent to API
-- Batch Google Sheets writes where possible
-"""
-
 from __future__ import annotations
 
 import json
@@ -57,7 +19,7 @@ from openai import OpenAI
 # CONFIG
 # ============================================================
 
-VERSION = "0.6"
+VERSION = "0.7"
 
 DEFAULT_MODEL = "gpt-5.6-luna"
 DEFAULT_LANGUAGE = "Vietnamese"
@@ -90,6 +52,7 @@ REQUEST_TIMEOUT = 20
 
 BRIEFING_HEADERS = [
     "article_id",
+    "run_id",
     "source",
     "title",
     "url",
@@ -596,7 +559,7 @@ def call_openai(
         },
         max_output_tokens=max_output_tokens,
         store=False,
-        prompt_cache_key="medical-news-briefing-v06",
+        prompt_cache_key="medical-news-briefing-v07",
     )
 
     return parse_json_safely(response.output_text)
@@ -784,51 +747,29 @@ def get_selected_articles(spreadsheet) -> list[dict]:
 
 def load_existing_briefings(
     worksheet,
-) -> dict[str, tuple[int, dict]]:
-
+) -> dict[tuple[str, str], tuple[int, dict]]:
+    """Load briefing rows keyed by (article_id, run_id)."""
     if worksheet is None:
         return {}
-
     values = worksheet.get_all_values()
-
     if not values:
         return {}
-
     headers = values[0]
-
     try:
         article_index = headers.index("article_id")
+        run_id_index = headers.index("run_id")
     except ValueError:
-        return {}
-
+        raise ValueError("Briefings sheet must contain both 'article_id' and 'run_id'.")
     result = {}
-
-    for row_number, row in enumerate(
-        values[1:],
-        start=2,
-    ):
-        if article_index >= len(row):
+    for row_number, row in enumerate(values[1:], start=2):
+        if article_index >= len(row) or run_id_index >= len(row):
             continue
-
-        article_id = clean_text(
-            row[article_index]
-        )
-
-        if not article_id:
+        article_id = clean_text(row[article_index])
+        run_id = clean_text(row[run_id_index])
+        if not article_id or not run_id:
             continue
-
-        row_dict = {
-            headers[i]: row[i]
-            for i in range(
-                min(len(headers), len(row))
-            )
-        }
-
-        result[article_id] = (
-            row_number,
-            row_dict,
-        )
-
+        row_dict = {headers[i]: row[i] for i in range(min(len(headers), len(row)))}
+        result[(article_id, run_id)] = (row_number, row_dict)
     return result
 
 
@@ -909,6 +850,9 @@ def build_briefing_row(
     row = {
         "article_id": clean_text(
             article.get("article_id")
+        ),
+        "run_id": clean_text(
+            article.get("run_id")
         ),
         "source": clean_text(
             article.get("source")
@@ -1077,6 +1021,13 @@ def process_articles(
         spreadsheet
     )
 
+    run_ids = {clean_text(article.get("run_id")) for article in articles if clean_text(article.get("run_id"))}
+    if len(run_ids) > 1:
+        raise ValueError("Selected articles contain multiple run_id values: " + ", ".join(sorted(run_ids)))
+    current_run_id = next(iter(run_ids), "")
+    if current_run_id:
+        print(f"[RUN] run_id={current_run_id}")
+
     print(
         f"[BRIEFING] Selected articles: "
         f"{len(articles)}"
@@ -1192,6 +1143,8 @@ def process_articles(
     failed = 0
     skipped = 0
     fallback_count = 0
+    ai_calls = 0
+    ai_calls_avoided = 0
 
     for article in articles:
 
@@ -1203,25 +1156,22 @@ def process_articles(
             article.get("title")
         )
 
+        run_id = clean_text(article.get("run_id"))
+
         if not article_id:
-            print(
-                "[SKIP] Article without article_id."
-            )
+            print("[SKIP] Article without article_id.")
             skipped += 1
             continue
 
-        print(
-            f"\n[BRIEFING] {title}"
-        )
+        if not run_id:
+            print(f"[ERROR] {title}: missing run_id.")
+            failed += 1
+            continue
 
-        # ----------------------------------------------------
-        # Skip if a successful briefing already exists.
-        # This is one of the most important cost controls.
-        # ----------------------------------------------------
+        print(f"\n[BRIEFING] {title}")
 
-        existing_item = existing.get(
-            article_id
-        )
+        # Skip only when the same article was successfully briefed in the same run.
+        existing_item = existing.get((article_id, run_id))
 
         if existing_item:
             row_number, old_row = existing_item
@@ -1229,11 +1179,9 @@ def process_articles(
             if is_successful_briefing(
                 old_row
             ):
-                print(
-                    "[SKIP] Successful briefing "
-                    "already exists."
-                )
+                print("[SKIP] Successful briefing already exists for this run.")
                 skipped += 1
+                ai_calls_avoided += 1
                 continue
 
         # ----------------------------------------------------
@@ -1294,6 +1242,8 @@ def process_articles(
         )
 
         try:
+
+            ai_calls += 1
 
             result = call_openai(
                 client=client,
@@ -1373,9 +1323,9 @@ def process_articles(
     print(
         f"Skipped: {skipped}"
     )
-    print(
-        f"Excerpt fallback: {fallback_count}"
-    )
+    print(f"Excerpt fallback: {fallback_count}")
+    print(f"New AI calls: {ai_calls}")
+    print(f"AI calls avoided: {ai_calls_avoided}")
 
     print("=" * 60)
 
