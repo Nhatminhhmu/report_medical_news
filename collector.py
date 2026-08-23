@@ -25,7 +25,7 @@ RUNS_SHEET = "Runs"
 REQUEST_TIMEOUT = 30
 
 USER_AGENT = (
-    "ReportMedicalNews/0.3 "
+    "ReportMedicalNews/0.4 "
     "(Healthcare Operations Intelligence)"
 )
 
@@ -955,6 +955,7 @@ def normalize_articles(
                 "article_id": make_article_id(
                     url
                 ),
+                "run_id": "",
                 "source": clean_text(
                     article.get(
                         "source",
@@ -1014,10 +1015,18 @@ def get_existing_article_ids(
 def save_articles(
     spreadsheet,
     articles,
+    run_id,
 ):
     worksheet = spreadsheet.worksheet(
         ARTICLES_SHEET
     )
+
+    run_id = clean_text(run_id)
+
+    if not run_id:
+        raise ValueError(
+            "save_articles requires a valid run_id."
+        )
 
     existing_ids = (
         get_existing_article_ids(
@@ -1057,6 +1066,7 @@ def save_articles(
                 article[
                     "article_id"
                 ],
+                run_id,
                 article[
                     "source"
                 ],
@@ -1129,6 +1139,9 @@ def main():
 
     print(
         f"Run ID: {run_id}"
+    )
+    print(
+        "[RUN] Articles will be stamped with this run_id."
     )
 
     print(
@@ -1313,6 +1326,7 @@ def main():
         saved = save_articles(
             spreadsheet,
             all_articles,
+            run_id,
         )
 
         print(
