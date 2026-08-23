@@ -224,7 +224,7 @@ def keyword_matches(
 # ============================================================
 
 DEFAULT_RULE_SETTINGS = {
-    "rule_engine_version": "1.2",
+    "rule_engine_version": "1.3",
     "keyword_title_weight": 30,
     "keyword_excerpt_weight": 15,
     "related_title_weight": 10,
@@ -427,6 +427,12 @@ def process_articles(
     topics,
     settings,
 ):
+    """
+    Evaluate Articles using header names rather than fixed column positions.
+
+    Collector-owned and Rule Engine-owned columns may therefore be moved
+    independently in Google Sheets without breaking the engine.
+    """
 
     worksheet = spreadsheet.worksheet(
         ARTICLES_SHEET
@@ -435,25 +441,21 @@ def process_articles(
     records = worksheet.get_all_records()
 
     if not records:
-
-        print(
-            "No articles found."
-        )
-
+        print("No articles found.")
         return
 
-    headers = worksheet.row_values(
-        1
-    )
+    headers = worksheet.row_values(1)
 
+    # Column order is intentionally irrelevant.
     header_index = {
-        header: index + 1
-        for index, header
-        in enumerate(headers)
+        clean_text(header): index + 1
+        for index, header in enumerate(headers)
+        if clean_text(header)
     }
 
     required_headers = [
         "article_id",
+        "run_id",
         "title",
         "excerpt",
         "matched_topics",
@@ -463,31 +465,59 @@ def process_articles(
         "matched_context_terms",
     ]
 
-    for header in required_headers:
+    missing = [
+        header
+        for header in required_headers
+        if header not in header_index
+    ]
 
-        if header not in header_index:
+    if missing:
+        raise ValueError(
+            "Missing Articles column(s): "
+            + ", ".join(missing)
+        )
 
-            raise ValueError(
-                f"Missing Articles column: "
-                f"{header}"
-            )
+    print(
+        "[RUN] Rule Engine preserves existing run_id values."
+    )
 
     updates = []
+    evaluated_count = 0
+    skipped_count = 0
 
     for row_number, article in enumerate(
         records,
         start=2,
     ):
-
-        # Skip already evaluated articles
-        current_score = clean_text(
-            article.get(
-                "rule_score",
-                "",
-            )
+        article_id = clean_text(
+            article.get("article_id", "")
         )
-        
+        run_id = clean_text(
+            article.get("run_id", "")
+        )
+        current_score = clean_text(
+            article.get("rule_score", "")
+        )
+
+        if not article_id:
+            skipped_count += 1
+            print(
+                f"[SKIP] Row {row_number}: missing article_id."
+            )
+            continue
+
+        if not run_id:
+            skipped_count += 1
+            print(
+                f"[SKIP] {article.get('title', '')[:80]}: "
+                "missing run_id."
+            )
+            continue
+
+        # A non-empty score means this article has already been evaluated.
+        # This also correctly treats 0 as an evaluated score.
         if current_score:
+            skipped_count += 1
             continue
 
         result = evaluate_article(
@@ -496,148 +526,65 @@ def process_articles(
             settings,
         )
 
-        matched_topics = ", ".join(
-            result[
-                "matched_topics"
-            ]
-        )
-        
-        score = result[
-            "rule_score"
-        ]
-        
-        matched_keywords = ", ".join(
-            result[
-                "matched_keywords"
-            ]
-        )
+        values_by_header = {
+            "matched_topics": ", ".join(
+                result["matched_topics"]
+            ),
+            "rule_score": result["rule_score"],
+            "matched_keywords": ", ".join(
+                result["matched_keywords"]
+            ),
+            "matched_related_terms": ", ".join(
+                result["matched_related_terms"]
+            ),
+            "matched_context_terms": ", ".join(
+                result["matched_context_terms"]
+            ),
+        }
 
-        matched_related_terms = ", ".join(
-            result[
-                "matched_related_terms"
-            ]
-        )
+        for header, value in values_by_header.items():
+            cell = gspread.utils.rowcol_to_a1(
+                row_number,
+                header_index[header],
+            )
+            updates.append(
+                {
+                    "range": cell,
+                    "values": [[value]],
+                }
+            )
 
-        matched_context_terms = ", ".join(
-            result[
-                "matched_context_terms"
-            ]
-        )
-
-        updates.append(
-            {
-                "range": (
-                    f"{gspread.utils.rowcol_to_a1(
-                        row_number,
-                        header_index[
-                            "matched_topics"
-                        ]
-                    )}"
-                ),
-                "values": [
-                    [matched_topics]
-                ],
-            }
-        )
-
-        updates.append(
-            {
-                "range": (
-                    f"{gspread.utils.rowcol_to_a1(
-                        row_number,
-                        header_index[
-                            "rule_score"
-                        ]
-                    )}"
-                ),
-                "values": [
-                    [score]
-                ],
-            }
-        )
-
-        updates.append(
-            {
-                "range": (
-                    f"{gspread.utils.rowcol_to_a1(
-                        row_number,
-                        header_index[
-                            "matched_keywords"
-                        ]
-                    )}"
-                ),
-                "values": [
-                    [matched_keywords]
-                ],
-            }
-        )
-
-        updates.append(
-            {
-                "range": (
-                    f"{gspread.utils.rowcol_to_a1(
-                        row_number,
-                        header_index[
-                            "matched_related_terms"
-                        ]
-                    )}"
-                ),
-                "values": [
-                    [matched_related_terms]
-                ],
-            }
-        )
-
-        updates.append(
-            {
-                "range": (
-                    f"{gspread.utils.rowcol_to_a1(
-                        row_number,
-                        header_index[
-                            "matched_context_terms"
-                        ]
-                    )}"
-                ),
-                "values": [
-                    [matched_context_terms]
-                ],
-            }
-        )
+        evaluated_count += 1
 
         print(
             f"{article.get('title', '')[:80]}"
         )
-
+        print(
+            f"  Run ID: {run_id}"
+        )
         print(
             f"  Topics: "
-            f"{matched_topics or 'NONE'}"
+            f"{values_by_header['matched_topics'] or 'NONE'}"
         )
-        
         print(
             f"  Rule score: "
-            f"{score}"
+            f"{values_by_header['rule_score']}"
         )
-        
         print(
             f"  Keywords: "
-            f"{matched_keywords or 'NONE'}"
+            f"{values_by_header['matched_keywords'] or 'NONE'}"
         )
-
         print(
             f"  Related terms: "
-            f"{matched_related_terms or 'NONE'}"
+            f"{values_by_header['matched_related_terms'] or 'NONE'}"
         )
-
         print(
             f"  Context terms: "
-            f"{matched_context_terms or 'NONE'}"
+            f"{values_by_header['matched_context_terms'] or 'NONE'}"
         )
+
     if not updates:
-
-        print(
-            "No unevaluated articles."
-        )
-
+        print("No unevaluated articles.")
         return
 
     worksheet.batch_update(
@@ -645,9 +592,13 @@ def process_articles(
     )
 
     print(
-        f"Updated "
-        f"{len(updates) // 5} articles."
+        f"Updated {evaluated_count} articles."
     )
+
+    if skipped_count:
+        print(
+            f"Skipped {skipped_count} articles."
+        )
 
 
 # ============================================================
