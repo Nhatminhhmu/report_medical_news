@@ -19,7 +19,7 @@ from openai import OpenAI
 # CONFIG
 # ============================================================
 
-VERSION = "0.7.2"
+VERSION = "0.7.4"
 
 DEFAULT_MODEL = "gpt-5.6-luna"
 DEFAULT_LANGUAGE = "Vietnamese"
@@ -29,7 +29,6 @@ DEFAULT_MAX_OUTPUT_TOKENS = 1400
 
 BRIEFINGS_SHEET = "Briefings"
 ARTICLES_SHEET = "Articles"
-SELECTION_SHEET = "Selection"
 METRICS_SHEET = "Reading Metrics"
 
 GOOGLE_SCOPES = [
@@ -691,55 +690,143 @@ def fetch_article_content(
 
 
 # ============================================================
-# SELECTION
+# ARTICLE INPUT / CURRENT RUN
 # ============================================================
 
-def get_selected_articles(spreadsheet) -> list[dict]:
+READY_FOR_BRIEFING_STATUS = "ready_for_briefing"
+BRIEFED_STATUS = "briefed"
 
-    worksheet = get_worksheet(
-        spreadsheet,
-        SELECTION_SHEET,
+
+def normalize_status(value: Any) -> str:
+    return re.sub(r"[\\s\\-]+", "_", clean_text(value).lower())
+
+
+def get_current_run_id(spreadsheet) -> str:
+    """Resolve the latest usable run_id. Runs is preferred."""
+    runs_sheet = get_worksheet(spreadsheet, "Runs")
+
+    if runs_sheet is not None:
+        records = runs_sheet.get_all_records()
+        candidates = []
+
+        for row in records:
+            run_id = clean_text(row.get("run_id"))
+            if not run_id:
+                continue
+
+            status = normalize_status(row.get("status"))
+            if status in {"failed", "error", "cancelled", "canceled"}:
+                continue
+
+            candidates.append(run_id)
+
+        if candidates:
+            return max(candidates)
+
+    articles_sheet = get_worksheet(spreadsheet, ARTICLES_SHEET)
+
+    if articles_sheet is not None:
+        records = articles_sheet.get_all_records()
+        candidates = [
+            clean_text(row.get("run_id"))
+            for row in records
+            if clean_text(row.get("run_id"))
+        ]
+
+        if candidates:
+            return max(candidates)
+
+    return ""
+
+
+def get_articles_ready_for_briefing(
+    spreadsheet,
+    current_run_id: str,
+) -> list[dict]:
+    """
+    Consume only articles explicitly released by Rule Engine.
+
+    Rule Engine owns minimum_score and eligibility.
+    No article-count limit is applied here.
+    """
+    worksheet = get_worksheet(spreadsheet, ARTICLES_SHEET)
+
+    if worksheet is None:
+        raise ValueError(f"'{ARTICLES_SHEET}' sheet was not found.")
+
+    if not current_run_id:
+        raise ValueError("Could not determine current run_id.")
+
+    records = worksheet.get_all_records()
+
+    articles = [
+        row
+        for row in records
+        if clean_text(row.get("run_id")) == current_run_id
+        and normalize_status(row.get("status"))
+        == READY_FOR_BRIEFING_STATUS
+    ]
+
+    articles.sort(
+        key=lambda row: (
+            -safe_float(row.get("rule_score"), 0),
+            clean_text(row.get("title")).lower(),
+        )
     )
 
-    if worksheet is not None:
-        records = worksheet.get_all_records()
+    return articles
 
-        if records:
-            return records
 
-    # Fallback:
-    # allow the engine to work without a Selection sheet.
-    articles_sheet = get_worksheet(
-        spreadsheet,
-        ARTICLES_SHEET,
-    )
+def update_article_status(
+    worksheet,
+    article_id: str,
+    run_id: str,
+    new_status: str,
+) -> bool:
+    """Update only the Articles row matching (article_id, run_id)."""
+    if worksheet is None:
+        return False
 
-    if articles_sheet is None:
-        raise ValueError(
-            "Neither Selection nor Articles sheet was found."
+    values = worksheet.get_all_values()
+    if not values:
+        return False
+
+    headers = values[0]
+
+    try:
+        article_index = headers.index("article_id")
+        run_id_index = headers.index("run_id")
+        status_index = headers.index("status")
+    except ValueError:
+        return False
+
+    for row_number, row in enumerate(values[1:], start=2):
+        article_value = clean_text(
+            row[article_index] if article_index < len(row) else ""
+        )
+        run_value = clean_text(
+            row[run_id_index] if run_id_index < len(row) else ""
         )
 
-    records = articles_sheet.get_all_records()
+        if article_value != article_id or run_value != run_id:
+            continue
 
-    selected = []
+        col = status_index + 1
+        letters = ""
+        n = col
 
-    for row in records:
-        selected_value = row.get("selected")
+        while n:
+            n, remainder = divmod(n - 1, 26)
+            letters = chr(65 + remainder) + letters
 
-        status = clean_text(
-            row.get("status")
-        ).lower()
+        worksheet.update(
+            range_name=f"{letters}{row_number}",
+            values=[[new_status]],
+            value_input_option="USER_ENTERED",
+        )
+        return True
 
-        if normalize_bool(selected_value):
-            selected.append(row)
-        elif status in {
-            "selected",
-            "briefing",
-            "ready",
-        }:
-            selected.append(row)
-
-    return selected
+    return False
 
 
 # ============================================================
@@ -1028,31 +1115,36 @@ def process_articles(
     metrics,
 ):
 
-    articles = get_selected_articles(
-        spreadsheet
+    current_run_id = get_current_run_id(spreadsheet)
+
+    print(f"[RUN] run_id={current_run_id or 'NONE'}")
+
+    if not current_run_id:
+        print("[BRIEFING] No current run_id found.")
+        return
+
+    articles = get_articles_ready_for_briefing(
+        spreadsheet=spreadsheet,
+        current_run_id=current_run_id,
     )
 
-    run_ids = {clean_text(article.get("run_id")) for article in articles if clean_text(article.get("run_id"))}
-    if len(run_ids) > 1:
-        raise ValueError("Selected articles contain multiple run_id values: " + ", ".join(sorted(run_ids)))
-    current_run_id = next(iter(run_ids), "")
-    if current_run_id:
-        print(f"[RUN] run_id={current_run_id}")
-
-    print(
-        f"[BRIEFING] Selected articles: "
-        f"{len(articles)}"
-    )
+    print(f"[BRIEFING] Ready for briefing: {len(articles)}")
 
     if not articles:
         print(
-            "[BRIEFING] No selected articles."
+            "[BRIEFING] No READY_FOR_BRIEFING articles "
+            f"for run_id={current_run_id}."
         )
         return
 
     briefings_sheet = get_worksheet(
         spreadsheet,
         BRIEFINGS_SHEET,
+    )
+
+    articles_sheet = get_worksheet(
+        spreadsheet,
+        ARTICLES_SHEET,
     )
 
     ensure_briefings_header(
@@ -1181,18 +1273,27 @@ def process_articles(
 
         print(f"\n[BRIEFING] {title}")
 
-        # Skip only when the same article was successfully briefed in the same run.
+        # The article was selected from RULE_EVALUATED in this exact run.
+        # If a successful briefing already exists for the same (article_id, run_id),
+        # do not spend another AI call.
         existing_item = existing.get((article_id, run_id))
 
         if existing_item:
             row_number, old_row = existing_item
 
-            if is_successful_briefing(
-                old_row
-            ):
+            if is_successful_briefing(old_row):
                 print("[SKIP] Successful briefing already exists for this run.")
                 skipped += 1
                 ai_calls_avoided += 1
+
+                # Repair pipeline state if an older run left Articles.status behind.
+                if normalize_status(article.get("status")) != "briefed":
+                    update_article_status(
+                        articles_sheet,
+                        article_id,
+                        run_id,
+                        "BRIEFED",
+                    )
                 continue
 
         # ----------------------------------------------------
@@ -1285,6 +1386,15 @@ def process_articles(
                 row_values=row_values,
             )
 
+            # Only mark the source article as BRIEFED after the Briefings
+            # row has been successfully written.
+            update_article_status(
+                articles_sheet,
+                article_id,
+                run_id,
+                "BRIEFED",
+            )
+
             successful += 1
 
             score_index = (
@@ -1313,6 +1423,8 @@ def process_articles(
                 f"{type(exc).__name__}: {exc}"
             )
 
+            # Keep Articles.status unchanged on failure so the article
+            # remains retryable on the next run.
             failed += 1
 
     print(
