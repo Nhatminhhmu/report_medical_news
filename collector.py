@@ -1082,7 +1082,7 @@ def save_articles(
                 article[
                     "excerpt"
                 ],
-                now_iso(),
+                datetime.now(timezone.utc).isoformat(),
                 "DISCOVERED",
                 "",
                 "",
