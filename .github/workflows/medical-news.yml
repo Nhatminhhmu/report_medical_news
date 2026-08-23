@@ -119,23 +119,42 @@ jobs:
           echo "============================================================"
           echo "VERIFYING GENERATED WEBSITE"
           echo "============================================================"
-
-          test -f site/index.html
-          test -f site/archive.html
-          test -f site/assets/style.css
-
+      
           echo ""
-          echo "Generated files:"
-          find site -maxdepth 3 -type f -print | sort
-
+          echo "Current directory:"
+          pwd
+      
           echo ""
-          echo "index.html:"
-          ls -lh site/index.html
-
+          echo "Repository root:"
+          ls -la
+      
           echo ""
-          echo "archive.html:"
-          ls -lh site/archive.html
-
+          echo "Site directory:"
+          if [ -d site ]; then
+            echo "site/ EXISTS"
+            find site -maxdepth 3 -type f -print | sort
+          else
+            echo "ERROR: site/ DOES NOT EXIST"
+          fi
+      
+          echo ""
+          echo "Expected files:"
+          
+          for file in \
+            site/index.html \
+            site/archive.html \
+            site/assets/style.css
+          do
+            if [ -f "$file" ]; then
+              echo "OK: $file"
+              ls -lh "$file"
+            else
+              echo "MISSING: $file"
+            fi
+          done
+      
+          echo ""
+          echo "============================================================"
       # ============================================================
       # 9. PERSIST WEBSITE / ARCHIVE
       # ============================================================
