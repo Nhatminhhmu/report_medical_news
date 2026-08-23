@@ -17,6 +17,7 @@ concurrency:
 # ================================================================
 
 jobs:
+
   build:
     runs-on: ubuntu-latest
 
@@ -24,6 +25,9 @@ jobs:
       contents: write
       pages: write
       id-token: write
+
+    outputs:
+      has_report: ${{ steps.check_report.outputs.has_report }}
 
     steps:
 
@@ -36,6 +40,7 @@ jobs:
         with:
           fetch-depth: 0
 
+
       # ------------------------------------------------------------
       # PYTHON
       # ------------------------------------------------------------
@@ -44,6 +49,7 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+
 
       # ------------------------------------------------------------
       # DEPENDENCIES
@@ -63,33 +69,54 @@ jobs:
             python-dateutil \
             lxml
 
-      # ------------------------------------------------------------
-      # COLLECTOR
-      # ------------------------------------------------------------
+
+      # ============================================================
+      # 1. COLLECTOR
+      # ============================================================
 
       - name: Run collector
+        id: collector
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           GOOGLE_SPREADSHEET_ID: ${{ secrets.GOOGLE_SPREADSHEET_ID }}
         run: |
-          python collector.py
+          set -o pipefail
 
-      # ------------------------------------------------------------
-      # RULE ENGINE
-      # ------------------------------------------------------------
+          python collector.py 2>&1 | tee collector.log
+
+          echo ""
+          echo "============================================================"
+          echo "CHECKING COLLECTOR RESULT"
+          echo "============================================================"
+
+          if grep -Eq "New articles saved: [1-9][0-9]*" collector.log; then
+            echo "has_new=true" >> "$GITHUB_OUTPUT"
+            echo "[PIPELINE] New articles detected."
+          else
+            echo "has_new=false" >> "$GITHUB_OUTPUT"
+            echo "[PIPELINE] No new articles detected."
+          fi
+
+
+      # ============================================================
+      # 2. RULE ENGINE
+      # ============================================================
 
       - name: Run rule engine
+        if: steps.collector.outputs.has_new == 'true'
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           GOOGLE_SPREADSHEET_ID: ${{ secrets.GOOGLE_SPREADSHEET_ID }}
         run: |
           python rule_engine.py
 
-      # ------------------------------------------------------------
-      # BRIEFING ENGINE
-      # ------------------------------------------------------------
+
+      # ============================================================
+      # 3. BRIEFING ENGINE
+      # ============================================================
 
       - name: Run briefing engine
+        if: steps.collector.outputs.has_new == 'true'
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           GOOGLE_SPREADSHEET_ID: ${{ secrets.GOOGLE_SPREADSHEET_ID }}
@@ -97,11 +124,13 @@ jobs:
         run: |
           python briefing_engine.py
 
-      # ------------------------------------------------------------
-      # REPORT ENGINE
-      # ------------------------------------------------------------
+
+      # ============================================================
+      # 4. REPORT ENGINE
+      # ============================================================
 
       - name: Run report engine
+        if: steps.collector.outputs.has_new == 'true'
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           GOOGLE_SPREADSHEET_ID: ${{ secrets.GOOGLE_SPREADSHEET_ID }}
@@ -111,20 +140,45 @@ jobs:
         run: |
           python report_engine.py
 
-      # ------------------------------------------------------------
-      # VERIFY WEBSITE
-      # ------------------------------------------------------------
+
+      # ============================================================
+      # 5. CHECK WHETHER A REPORT WAS ACTUALLY GENERATED
+      # ============================================================
+
+      - name: Check generated report
+        id: check_report
+        run: |
+          echo "============================================================"
+          echo "CHECKING GENERATED REPORT"
+          echo "============================================================"
+
+          if [ -f "site/index.html" ]; then
+            echo "has_report=true" >> "$GITHUB_OUTPUT"
+
+            echo "[SITE] Report site detected."
+
+            echo ""
+            echo "Generated files:"
+            find site -maxdepth 3 -type f -print | sort
+
+          else
+            echo "has_report=false" >> "$GITHUB_OUTPUT"
+
+            echo "[SITE] No report generated."
+            echo "[PIPELINE] Nothing to publish."
+          fi
+
+
+      # ============================================================
+      # 6. VERIFY WEBSITE
+      # ============================================================
 
       - name: Verify generated website
+        if: steps.check_report.outputs.has_report == 'true'
         run: |
           echo "============================================================"
           echo "VERIFYING GENERATED WEBSITE"
           echo "============================================================"
-
-          find site -maxdepth 3 -type f -print | sort
-
-          echo ""
-          echo "Checking required files..."
 
           test -f site/index.html
           test -f site/archive.html
@@ -134,11 +188,13 @@ jobs:
           echo "archive.html OK"
           echo "style.css    OK"
 
-      # ------------------------------------------------------------
-      # SAVE WEBSITE TO REPOSITORY
-      # ------------------------------------------------------------
+
+      # ============================================================
+      # 7. PERSIST WEBSITE / ARCHIVE
+      # ============================================================
 
       - name: Persist website archive
+        if: steps.check_report.outputs.has_report == 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -152,18 +208,22 @@ jobs:
             git push
           fi
 
-      # ------------------------------------------------------------
-      # CONFIGURE PAGES
-      # ------------------------------------------------------------
+
+      # ============================================================
+      # 8. CONFIGURE GITHUB PAGES
+      # ============================================================
 
       - name: Setup GitHub Pages
+        if: steps.check_report.outputs.has_report == 'true'
         uses: actions/configure-pages@v5
 
-      # ------------------------------------------------------------
-      # UPLOAD PAGES ARTIFACT
-      # ------------------------------------------------------------
+
+      # ============================================================
+      # 9. UPLOAD PAGES ARTIFACT
+      # ============================================================
 
       - name: Upload GitHub Pages artifact
+        if: steps.check_report.outputs.has_report == 'true'
         uses: actions/upload-pages-artifact@v4
         with:
           path: ./site
@@ -178,6 +238,8 @@ jobs:
 
     needs: build
 
+    if: needs.build.outputs.has_report == 'true'
+
     permissions:
       pages: write
       id-token: write
@@ -188,9 +250,18 @@ jobs:
 
     steps:
 
+      # ------------------------------------------------------------
+      # DEPLOY
+      # ------------------------------------------------------------
+
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
+
+
+      # ------------------------------------------------------------
+      # SHOW URL
+      # ------------------------------------------------------------
 
       - name: Show Pages URL
         run: |
