@@ -3,7 +3,7 @@ name: Medical News Intelligence
 on:
   schedule:
     # 22:30 Asia/Ho_Chi_Minh = 15:30 UTC
-    - cron: "30 15 * * *"
+    - cron: "30 15 */3 * *"
 
   workflow_dispatch:
 
